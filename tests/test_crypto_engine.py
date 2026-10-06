@@ -206,3 +206,26 @@ def test_pipeline_runs_crypto_engine(tmp_path):
     findings = run_scan(str(tmp_path), engines=engines)
     assert len(findings) == 1
     assert findings[0].engine == "crypto"
+
+
+def test_unrelated_call_with_verify_kwarg_ignored(tmp_path):
+    code = (
+        "class Form:\n"
+        "    def check(self, data, verify=True): pass\n"
+        "f = Form()\n"
+        "f.check(data, verify=False)\n"
+    )
+    write_py(tmp_path, "a.py", code)
+    found = scan(tmp_path)
+    assert not any(f.extra.get("rule") == "tls-verify-disabled" for f in found)
+
+
+def test_unrelated_call_with_initial_value_ignored(tmp_path):
+    code = (
+        "def accumulate(items, initial_value=0): return items\n"
+        "res = accumulate([1, 2], initial_value=0)\n"
+    )
+    write_py(tmp_path, "a.py", code)
+    found = scan(tmp_path)
+    assert not any(f.extra.get("rule") == "static-iv" for f in found)
+

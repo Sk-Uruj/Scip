@@ -538,7 +538,7 @@ def test_cli_output_flag_writes_utf8_json(tmp_path):
     ("discord-bot-token", lambda: 'DISCORD_BOT = "' + 'N' + "".join(chr(65 + (i % 26)) for i in range(24)) + '.' + 'A1B2C3' + '.' + "".join(chr(97 + (i % 26)) for i in range(28)) + '"'),
     ("twilio-api-key", lambda: 'TWILIO_KEY = "' + 'S' + 'K' + "".join(hex(i % 16)[2:] for i in range(32)) + '"'),
     ("vault-token", lambda: 'VAULT = "' + 'h' + 'v' + 's.' + "".join(chr(97 + (i % 26)) for i in range(24)) + '"'),
-    ("gcp-service-account", lambda: '{"private_key_id": "' + 'f' * 40 + '"}'),
+    ("gcp-service-account", lambda: '{"private_key": "' + '-----BEGIN PRIVATE KEY-----' + "".join(chr(65 + (i % 26)) for i in range(50)) + '"}'),
 ])
 def test_new_provider_rules(tmp_path, rule_id, line_builder):
     line = line_builder()

@@ -215,16 +215,17 @@ class CryptoVisitor(ast.NodeVisitor):
         is_md5 = False
         is_sha1 = False
 
-        if any(func_name.endswith(x) for x in (
-            "hashlib.md5", "Crypto.Hash.MD5.new", "MD5.new", "hashes.MD5"
-        )):
+        if (
+            func_name in ("hashlib.md5", "md5")
+            or func_name.endswith((".hashlib.md5", "Crypto.Hash.MD5.new", "MD5.new", "hashes.MD5"))
+        ):
             is_md5 = True
-        elif any(func_name.endswith(x) for x in (
-            "hashlib.sha1", "Crypto.Hash.SHA.new", "Crypto.Hash.SHA1.new",
-            "SHA.new", "SHA1.new", "hashes.SHA1"
-        )):
+        elif (
+            func_name in ("hashlib.sha1", "sha1")
+            or func_name.endswith((".hashlib.sha1", "Crypto.Hash.SHA.new", "Crypto.Hash.SHA1.new", "SHA.new", "SHA1.new", "hashes.SHA1"))
+        ):
             is_sha1 = True
-        elif func_name.endswith("hashlib.new"):
+        elif func_name in ("hashlib.new",) or func_name.endswith(".hashlib.new"):
             name_arg = None
             if node.args:
                 name_arg = _get_constant_val(node.args[0])
@@ -274,7 +275,7 @@ class CryptoVisitor(ast.NodeVisitor):
             ))
 
     def _check_ciphers_and_modes(self, node: ast.Call, func_name: str) -> None:
-        if any(func_name.endswith(x) for x in (
+        if any(func_name.endswith(x) or func_name == x for x in (
             "Crypto.Cipher.DES.new", "DES.new", "algorithms.TripleDES",
             "Crypto.Cipher.DES3.new", "DES3.new"
         )):
@@ -291,7 +292,7 @@ class CryptoVisitor(ast.NodeVisitor):
                 exploitability=0.6,
                 extra={"rule": "insecure-cipher-des", "cipher": "DES/3DES"},
             ))
-        elif any(func_name.endswith(x) for x in (
+        elif any(func_name.endswith(x) or func_name == x for x in (
             "Crypto.Cipher.ARC4.new", "ARC4.new", "Crypto.Cipher.RC4.new", "RC4.new", "algorithms.ARC4"
         )):
             self.findings.append(Finding(
@@ -326,6 +327,15 @@ class CryptoVisitor(ast.NodeVisitor):
         self._check_static_iv(node, func_name)
 
     def _check_static_iv(self, node: ast.Call, func_name: str) -> None:
+        # Gate behind cipher constructor or cipher mode call sites
+        is_cipher_call = any(func_name.endswith(c) or func_name == c for c in (
+            "AES.new", "DES.new", "DES3.new", "Blowfish.new", "ARC4.new",
+            "Cipher", "Cipher.new",
+            "modes.CBC", "modes.CTR", "modes.CFB", "modes.OFB", "modes.GCM"
+        ))
+        if not is_cipher_call:
+            return
+
         iv_val = None
         for kw in node.keywords:
             if kw.arg in ("iv", "nonce", "initial_value"):
@@ -333,7 +343,7 @@ class CryptoVisitor(ast.NodeVisitor):
                 if iv_val is None and isinstance(kw.value, ast.Name):
                     iv_val = self.local_constants.get(kw.value.id)
 
-        if any(func_name.endswith(m) for m in ("modes.CBC", "modes.CTR", "modes.CFB", "modes.OFB")):
+        if any(func_name.endswith(m) for m in ("modes.CBC", "modes.CTR", "modes.CFB", "modes.OFB", "modes.GCM")):
             if node.args:
                 iv_val = _get_constant_val(node.args[0])
                 if iv_val is None and isinstance(node.args[0], ast.Name):
@@ -389,9 +399,7 @@ class CryptoVisitor(ast.NodeVisitor):
             ))
 
     def _check_network_misuse(self, node: ast.Call, func_name: str) -> None:
-        if any(func_name.endswith(x) for x in (
-            "ssl._create_unverified_context", "_create_unverified_context"
-        )):
+        if func_name in ("ssl._create_unverified_context", "_create_unverified_context") or func_name.endswith(".ssl._create_unverified_context"):
             self.findings.append(Finding(
                 engine="crypto",
                 title="TLS certificate verification globally bypassed with _create_unverified_context()",
@@ -409,38 +417,47 @@ class CryptoVisitor(ast.NodeVisitor):
                 extra={"rule": "tls-verify-disabled"},
             ))
 
-        for kw in node.keywords:
-            if kw.arg == "verify" and _get_constant_val(kw.value) is False:
-                self.findings.append(Finding(
-                    engine="crypto",
-                    title="TLS certificate verification disabled (verify=False)",
-                    file=self.file_path,
-                    line=node.lineno,
-                    cwe="CWE-295",
-                    severity=8.0,
-                    description=(
-                        "Setting verify=False disables TLS certificate and hostname validation, allowing "
-                        "attackers on the same network or DNS to intercept and decrypt traffic."
-                    ),
-                    evidence=self._get_evidence(node),
-                    fix_hint="Remove verify=False or provide a trusted CA bundle path.",
-                    exploitability=0.7,
-                    extra={"rule": "tls-verify-disabled", "call": func_name},
-                ))
-            elif kw.arg == "cert_reqs" and _get_constant_val(kw.value) in ("CERT_NONE", 0, "none"):
-                self.findings.append(Finding(
-                    engine="crypto",
-                    title="TLS certificate requirements disabled (cert_reqs=CERT_NONE)",
-                    file=self.file_path,
-                    line=node.lineno,
-                    cwe="CWE-295",
-                    severity=8.0,
-                    description="Setting cert_reqs='CERT_NONE' bypasses TLS server certificate verification.",
-                    evidence=self._get_evidence(node),
-                    fix_hint="Enforce ssl.CERT_REQUIRED.",
-                    exploitability=0.7,
-                    extra={"rule": "tls-verify-disabled", "call": func_name},
-                ))
+        # Gate verify=False and cert_reqs behind known HTTP client calls
+        is_http_call = any(func_name.startswith(p) for p in (
+            "requests.", "httpx.", "urllib3.", "aiohttp.", "urllib.request."
+        )) or any(func_name.endswith(s) or func_name == s for s in (
+            ".get", ".post", ".put", ".delete", ".patch", ".head", ".request",
+            ".Session", ".Client", ".AsyncClient", ".PoolManager",
+            "get", "post", "put", "delete", "request"
+        ))
+        if is_http_call:
+            for kw in node.keywords:
+                if kw.arg == "verify" and _get_constant_val(kw.value) is False:
+                    self.findings.append(Finding(
+                        engine="crypto",
+                        title="TLS certificate verification disabled (verify=False)",
+                        file=self.file_path,
+                        line=node.lineno,
+                        cwe="CWE-295",
+                        severity=8.0,
+                        description=(
+                            "Setting verify=False disables TLS certificate and hostname validation, allowing "
+                            "attackers on the same network or DNS to intercept and decrypt traffic."
+                        ),
+                        evidence=self._get_evidence(node),
+                        fix_hint="Remove verify=False or provide a trusted CA bundle path.",
+                        exploitability=0.7,
+                        extra={"rule": "tls-verify-disabled", "call": func_name},
+                    ))
+                elif kw.arg == "cert_reqs" and _get_constant_val(kw.value) in ("CERT_NONE", 0, "none"):
+                    self.findings.append(Finding(
+                        engine="crypto",
+                        title="TLS certificate requirements disabled (cert_reqs=CERT_NONE)",
+                        file=self.file_path,
+                        line=node.lineno,
+                        cwe="CWE-295",
+                        severity=8.0,
+                        description="Setting cert_reqs='CERT_NONE' bypasses TLS server certificate verification.",
+                        evidence=self._get_evidence(node),
+                        fix_hint="Enforce ssl.CERT_REQUIRED.",
+                        exploitability=0.7,
+                        extra={"rule": "tls-verify-disabled", "call": func_name},
+                    ))
 
         if any(func_name.startswith(p) for p in (
             "requests.get", "requests.post", "requests.put", "requests.delete",

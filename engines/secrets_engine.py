@@ -202,15 +202,15 @@ PROVIDER_RULES: List[Rule] = [
     _r("huggingface-token", "Hugging Face access token", r"\b(hf_[A-Za-z0-9]{34,})\b",
        ("hf_",), 9.0, 0.9),
     _r("discord-bot-token", "Discord bot token",
-       r"(?i)(?:discord|bot)[\"']?\s*[:=]\s*[\"']?([MN][A-Za-z\d]{23,25}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,38})\b",
+       r"(?i)\b(?:discord(?:[_\-]?bot)?|bot)[\"']?\s*[:=]\s*[\"']?([MN][A-Za-z\d]{23,25}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,38})\b",
        ("discord", "bot"), 8.5, 0.8),
     _r("twilio-api-key", "Twilio API key", r"\b(SK[0-9a-fA-F]{32})\b",
        ("sk",), 8.0, 0.8),
     _r("vault-token", "HashiCorp Vault token", r"\b(hvs\.[A-Za-z0-9_\-]{24,})\b",
        ("hvs.",), 8.5, 0.8),
-    _r("gcp-service-account", "GCP service account private key ID",
-       r"\"private_key_id\"\s*:\s*\"([0-9a-f]{40})\"",
-       ("private_key_id",), 8.5, 0.8),
+    _r("gcp-service-account", "GCP service account private key",
+       r"\"private_key\"\s*:\s*\"(-----BEGIN (?:RSA )?PRIVATE KEY[^\"]+)\"",
+       ("private_key",), 9.0, 0.9, cwe="CWE-321"),
 ]
 
 _KEYWORDS = (r"(?:password|passwd|pwd|secret|token|api[_\-]?key|apikey|access[_\-]?key|auth[_\-]?key"
@@ -578,6 +578,7 @@ class SecretsEngine(Engine):
         errfile = tempfile.TemporaryFile()
         commits = 0
         hist_matches = 0
+        truncated_lines = 0
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile, text=True,
                                     encoding="utf-8", errors="replace")
@@ -643,6 +644,8 @@ class SecretsEngine(Engine):
                     file_lines_scanned += 1
                     if len(hunk) >= 5000:
                         flush()
+                else:
+                    truncated_lines += 1
                 new_no += 1
         flush()
         proc.wait()
@@ -653,7 +656,11 @@ class SecretsEngine(Engine):
             self.stats["history_note"] = f"git log failed: {err[:200]}"
             log.warning("git log failed for %s: %s", root, err[:200])
             return
-        self.stats.update(history_scanned=True, commits_scanned=commits)
+        self.stats.update(
+            history_scanned=True,
+            commits_scanned=commits,
+            truncated_diff_lines=truncated_lines,
+        )
 
     # ---- main entry ------------------------------------------------------ #
     def scan(self, repo_path: str) -> List[Finding]:
