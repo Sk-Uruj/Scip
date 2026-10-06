@@ -22,6 +22,7 @@ from engines.bandit_engine import BanditEngine
 from engines.dependency_engine import DependencyEngine
 from engines.secrets_engine import SecretsEngine
 from engines.semgrep_engine import SemgrepEngine
+from scoring import score_and_sort_findings
 # from engines.crypto_engine import CryptoEngine
 # from engines.churn_engine import ChurnEngine
 
@@ -112,6 +113,9 @@ def run_scan(
         if merged > 0:
             print(f"[+] Correlated & merged {merged} duplicate/overlapping finding(s)", file=sys.stderr)
 
+    # 3. Calculate 0-100 risk score and sort by risk_score descending
+    active = score_and_sort_findings(active, repo_path=repo_path)
+
     return active
 
 
@@ -123,9 +127,9 @@ def print_table(findings: List[Finding], engines: Optional[list] = None) -> None
     if not findings:
         print("No findings.")
     else:
-        sorted_findings = sorted(findings, key=lambda f: (-f.severity, -f.exploitability))
-        print(f"\n{'#':>3}  {'SEV':>4}  {'EXPL':>5}  {'ENGINE':<11} {'LOCATION':<28} TITLE")
-        print("-" * 110)
+        sorted_findings = sorted(findings, key=lambda f: (-f.risk_score, -f.severity, -f.exploitability))
+        print(f"\n{'#':>3}  {'RISK':>6}  {'SEV':>4}  {'EXPL':>5}  {'ENGINE':<11} {'LOCATION':<28} TITLE")
+        print("-" * 118)
         for i, f in enumerate(sorted_findings, 1):
             loc = f"{f.file}:{f.line}" if f.line else f.file
             if len(loc) > 28:
@@ -134,7 +138,7 @@ def print_table(findings: List[Finding], engines: Optional[list] = None) -> None
             if len(title) > 60:
                 title = title[:57] + "..."
             engine_label = f"{f.engine}*" if f.extra.get("corroborated") else f.engine
-            print(f"{i:>3}  {f.severity:>4.1f}  {f.exploitability:>5.2f}  {engine_label:<11} {loc:<28} {title}")
+            print(f"{i:>3}  {f.risk_score:>6.2f}  {f.severity:>4.1f}  {f.exploitability:>5.2f}  {engine_label:<11} {loc:<28} {title}")
         print(f"\nTotal: {len(findings)} finding(s)")
 
     if engines:

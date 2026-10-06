@@ -9,4 +9,4 @@ uvicorn
 radon
 packaging
 bandit
-semgrep
+semgrep==1.179.0

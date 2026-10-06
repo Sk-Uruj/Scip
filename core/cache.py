@@ -22,7 +22,7 @@ class Cache:
     def _path(self, namespace: str, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         return self.dir / f"{namespace}_{digest}.json"
-
+        
     def get(self, namespace: str, key: str, ttl: Optional[float] = None) -> Optional[Any]:
         """Return cached value, or None on miss. ttl=None means 'any age is fine'."""
         if not self.enabled:
