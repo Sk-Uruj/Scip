@@ -22,10 +22,10 @@ from engines.bandit_engine import BanditEngine
 from engines.dependency_engine import DependencyEngine
 from engines.secrets_engine import SecretsEngine
 from engines.semgrep_engine import SemgrepEngine
-# from engines.crypto_engine import CryptoEngine
+from engines.crypto_engine import CryptoEngine
 # from engines.churn_engine import ChurnEngine
 
-CONSTRUCTABLE_ENGINES: Set[str] = {"dependency", "secrets", "bandit", "semgrep"}
+CONSTRUCTABLE_ENGINES: Set[str] = {"dependency", "secrets", "bandit", "semgrep", "crypto"}
 KNOWN_ENGINES: Set[str] = CONSTRUCTABLE_ENGINES
 
 
@@ -34,6 +34,7 @@ def get_engines(
     scan_history: bool = True,
     run_bandit: bool = True,
     run_semgrep: bool = True,
+    run_crypto: bool = True,
     bandit_config: Optional[str] = None,
     semgrep_rules: Optional[str] = None,
     enabled_engines: Optional[List[str]] = None,
@@ -44,6 +45,7 @@ def get_engines(
         SecretsEngine(scan_history=scan_history),
         BanditEngine(config_file=bandit_config, include_suppressed=include_suppressed),
         SemgrepEngine(rules_path=semgrep_rules, include_suppressed=include_suppressed),
+        CryptoEngine(),
     ]
     if enabled_engines is not None:
         selected = {e.strip().lower() for e in enabled_engines}
@@ -54,6 +56,8 @@ def get_engines(
         if e.name == "bandit" and not run_bandit:
             continue
         if e.name == "semgrep" and not run_semgrep:
+            continue
+        if e.name == "crypto" and not run_crypto:
             continue
         active.append(e)
     return active
@@ -161,6 +165,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-history", action="store_true", help="secrets engine: skip the git-history scan")
     ap.add_argument("--no-bandit", action="store_true", help="skip the Bandit security engine")
     ap.add_argument("--no-semgrep", action="store_true", help="skip the Semgrep security engine")
+    ap.add_argument("--no-crypto", action="store_true", help="skip the Crypto security engine")
     ap.add_argument("--no-dedup", action="store_true", help="disable cross-tool finding deduplication")
     ap.add_argument("--baseline", metavar="FILE", help="path to baseline suppression JSON file (.scip-baseline.json)")
     ap.add_argument("--make-baseline", metavar="FILE", help="record current findings into a baseline file")
@@ -214,6 +219,7 @@ def main(argv=None) -> int:
         scan_history=not args.no_history,
         run_bandit=not args.no_bandit,
         run_semgrep=not args.no_semgrep,
+        run_crypto=not args.no_crypto,
         bandit_config=args.bandit_config,
         semgrep_rules=args.semgrep_rules,
         enabled_engines=enabled,

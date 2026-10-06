@@ -199,16 +199,32 @@ PROVIDER_RULES: List[Rule] = [
        ("://",), 8.0, 0.8),
     _r("jwt", "JSON Web Token", r"\b(eyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b",
        ("eyj",), 6.0, 0.4),
+    _r("huggingface-token", "Hugging Face access token", r"\b(hf_[A-Za-z0-9]{34,})\b",
+       ("hf_",), 9.0, 0.9),
+    _r("discord-bot-token", "Discord bot token",
+       r"(?i)(?:discord|bot)[\"']?\s*[:=]\s*[\"']?([MN][A-Za-z\d]{23,25}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,38})\b",
+       ("discord", "bot"), 8.5, 0.8),
+    _r("twilio-api-key", "Twilio API key", r"\b(SK[0-9a-fA-F]{32})\b",
+       ("sk",), 8.0, 0.8),
+    _r("vault-token", "HashiCorp Vault token", r"\b(hvs\.[A-Za-z0-9_\-]{24,})\b",
+       ("hvs.",), 8.5, 0.8),
+    _r("gcp-service-account", "GCP service account private key ID",
+       r"\"private_key_id\"\s*:\s*\"([0-9a-f]{40})\"",
+       ("private_key_id",), 8.5, 0.8),
 ]
 
 _KEYWORDS = (r"(?:password|passwd|pwd|secret|token|api[_\-]?key|apikey|access[_\-]?key|auth[_\-]?key"
              r"|private[_\-]?key|client[_\-]?secret|credential)")
 _GENERIC_HINTS = ("password", "passwd", "pwd", "secret", "token", "api_key", "api-key", "apikey",
                   "access_key", "access-key", "auth_key", "auth-key", "private_key", "private-key",
-                  "credential")
+                  "credential", "getenv", "environ")
 GENERIC_QUOTED = re.compile(
     r"(?P<key>[A-Za-z0-9_.\-]*" + _KEYWORDS + r"[A-Za-z0-9_.\-]*)[\"']?\]?\s*(?::|=)\s*"
     r"(?:[bBrRuUfF]{1,2})?(?P<q>[\"'])(?P<val>[^\"'\n\\]{4,200})(?P=q)", re.I)
+GENERIC_GETENV = re.compile(
+    r"(?:(?P<lhs>[A-Za-z0-9_.\-]*" + _KEYWORDS + r"[A-Za-z0-9_.\-]*)\s*=\s*)?"
+    r"(?:os\.)?(?:environ\.get|getenv)\s*\(\s*[\"'](?P<key>[^\"']+)[\"']\s*,\s*"
+    r"(?:[bBrRuUfF]{1,2})?(?P<q>[\"'])(?P<val>[^\"'\n\\]{4,200})(?P=q)\s*\)", re.I)
 GENERIC_UNQUOTED = re.compile(
     r"^\s*(?:export\s+|ENV\s+|set\s+)?(?P<key>[A-Za-z0-9_.\-]*" + _KEYWORDS + r"[A-Za-z0-9_.\-]*)\s*(?::|=)\s*"
     r"(?P<val>[^\s#\"'$%{<\[|>!&*][^\s#]{5,})\s*(?:#.*)?$", re.I)
@@ -405,6 +421,12 @@ def scan_lines(lines: List[Tuple[int, str]], filename: str = "", use_entropy: bo
                 if pm and "f" in pm.group(1).lower():         # f-string -> interpolation, not a literal
                     continue
                 candidates.append((mt.group("key"), mt.group("val"), mt.span("val")))
+            for mt in GENERIC_GETENV.finditer(text):
+                pm = re.search(r"(?<![A-Za-z0-9_])([bBrRuUfF]{1,2})$", text[:mt.start("q")])
+                if pm and "f" in pm.group(1).lower():
+                    continue
+                k = mt.group("key") if credential_key(mt.group("key")) else (mt.group("lhs") or mt.group("key"))
+                candidates.append((k, mt.group("val"), mt.span("val")))
             if config:
                 mt = GENERIC_UNQUOTED.match(text)
                 if mt:
@@ -436,6 +458,8 @@ def scan_lines(lines: List[Tuple[int, str]], filename: str = "", use_entropy: bo
             for mt in ENTROPY_RE.finditer(text):
                 val = mt.group(1)
                 if re.fullmatch(r"[0-9a-fA-F]+", val) or re.fullmatch(r"[0-9]+", val):
+                    continue
+                if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", val):
                     continue
                 if re.fullmatch(r"[A-Za-z_\-]+", val) or "//" in val or looks_like_alphabet(val):
                     continue
@@ -566,10 +590,11 @@ class SecretsEngine(Engine):
         in_header = False
         hunk: List[Tuple[int, str]] = []
         new_no = 0
+        file_lines_scanned = 0
 
         def flush() -> None:
             nonlocal hunk, hist_matches
-            if hunk and cur_file and len(hunk) <= MAX_HUNK_LINES and not should_skip_path(cur_file):
+            if hunk and cur_file and not should_skip_path(cur_file):
                 for m in scan_lines(hunk, cur_file, self.use_entropy):
                     agg = self._register(aggs, m)
                     agg.is_test = agg.is_test and is_test_path(cur_file)
@@ -590,11 +615,13 @@ class SecretsEngine(Engine):
                 commit = {"commit": parts[0], "author": parts[1] if len(parts) > 1 else "",
                           "date": parts[2] if len(parts) > 2 else ""}
                 cur_file, in_header = None, False
+                file_lines_scanned = 0
                 commits += 1
                 continue
             if line.startswith("diff --git "):
                 flush()
                 cur_file, in_header = None, True
+                file_lines_scanned = 0
                 continue
             if in_header:
                 if line.startswith("+++ "):
@@ -611,8 +638,11 @@ class SecretsEngine(Engine):
                 new_no = int(mt.group(1)) if mt else 0
                 continue
             if line.startswith("+"):
-                if len(hunk) <= MAX_HUNK_LINES:
+                if file_lines_scanned < MAX_HUNK_LINES:
                     hunk.append((new_no, line[1:]))
+                    file_lines_scanned += 1
+                    if len(hunk) >= 5000:
+                        flush()
                 new_no += 1
         flush()
         proc.wait()

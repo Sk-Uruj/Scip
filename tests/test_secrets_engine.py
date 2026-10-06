@@ -530,3 +530,39 @@ def test_cli_output_flag_writes_utf8_json(tmp_path):
     assert not raw.startswith(b"\xff\xfe")                          # not UTF-16
     data = json.loads(raw.decode("utf-8"))
     assert data and data[0]["engine"] == "secrets"
+
+
+# ------------------------------------------------------------- new enhancements --
+@pytest.mark.parametrize("rule_id,line_builder", [
+    ("huggingface-token", lambda: 'HF_TOKEN = "' + 'h' + 'f_' + "".join(chr(65 + (i % 26)) for i in range(35)) + '"'),
+    ("discord-bot-token", lambda: 'DISCORD_BOT = "' + 'N' + "".join(chr(65 + (i % 26)) for i in range(24)) + '.' + 'A1B2C3' + '.' + "".join(chr(97 + (i % 26)) for i in range(28)) + '"'),
+    ("twilio-api-key", lambda: 'TWILIO_KEY = "' + 'S' + 'K' + "".join(hex(i % 16)[2:] for i in range(32)) + '"'),
+    ("vault-token", lambda: 'VAULT = "' + 'h' + 'v' + 's.' + "".join(chr(97 + (i % 26)) for i in range(24)) + '"'),
+    ("gcp-service-account", lambda: '{"private_key_id": "' + 'f' * 40 + '"}'),
+])
+def test_new_provider_rules(tmp_path, rule_id, line_builder):
+    line = line_builder()
+    write(tmp_path, "secrets.py", line + "\n")
+    found = scan(tmp_path)
+    assert rule_id in rules(found)
+
+
+def test_getenv_hardcoded_defaults_detected(tmp_path):
+    code = (
+        'db_pass = os.getenv("DB_PASSWORD", "supersecret12345")\n'
+        'api_key = os.environ.get("API_KEY", "prod_api_key_xyz987")\n'
+    )
+    write(tmp_path, "config.py", code)
+    found = scan(tmp_path)
+    flagged_vars = {str(f.extra.get("variable", "")).lower() for f in found}
+    assert any("password" in v for v in flagged_vars)
+    assert any("api_key" in v for v in flagged_vars)
+    assert any("supersecret" in f.description or "generic" in f.extra.get("rule", "") for f in found)
+
+
+def test_uuid_not_flagged_as_high_entropy(tmp_path):
+    code = 'ID = "550e8400-e29b-41d4-a716-446655440000"\n'
+    write(tmp_path, "record.py", code)
+    found = scan(tmp_path, use_entropy=True)
+    assert not any(f.extra.get("rule") == "high-entropy-string" for f in found)
+

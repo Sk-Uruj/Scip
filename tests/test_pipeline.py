@@ -61,8 +61,9 @@ def test_main_engines_validation(tmp_path):
     # 2. Unknown typo engine name returns 2
     assert main([str(tmp_path), "--engines", "bandt"]) == 2
 
-    # 3. Unconstructed engine (crypto) returns 2
-    assert main([str(tmp_path), "--engines", "crypto"]) == 2
+    # 3. Unconstructed engine (churn) returns 2, constructed engine (crypto) returns 0
+    assert main([str(tmp_path), "--engines", "churn"]) == 2
+    assert main([str(tmp_path), "--engines", "crypto"]) == 0
 
     # 4. Empty comma string returns 2
     assert main([str(tmp_path), "--engines", ","]) == 2
