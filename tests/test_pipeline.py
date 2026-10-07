@@ -241,3 +241,29 @@ def test_main_include_suppressed_cli(tmp_path, monkeypatch):
     data = json.loads(out_file.read_text(encoding="utf-8"))
     assert len(data) == 1
     assert data[0]["extra"].get("suppressed") is True
+
+
+def test_pipeline_no_scoring_opt_out(tmp_path, monkeypatch):
+    """Verify that --no-scoring bypasses scoring and retains legacy ordering."""
+    f1 = Finding(engine="bandit", title="High Sev", file="a.py", severity=9.0, exploitability=0.1)
+    f2 = Finding(engine="bandit", title="Low Sev High Exploit", file="b.py", severity=3.0, exploitability=0.9)
+
+    class MockEngine:
+        name = "bandit"
+        stats = {}
+        def is_available(self):
+            return True
+        def scan(self, path):
+            return [f1.clone(), f2.clone()]
+
+    monkeypatch.setattr("core.pipeline.get_engines", lambda **kw: [MockEngine()])
+
+    # Run with default scoring
+    res_scored = run_scan(str(tmp_path), engines=[MockEngine()], scoring=True)
+    assert all(f.risk_score > 0 for f in res_scored)
+
+    # Run with scoring=False: risk_score remains 0, sorted by (-severity, -exploitability)
+    res_unscored = run_scan(str(tmp_path), engines=[MockEngine()], scoring=False)
+    assert all(f.risk_score == 0.0 for f in res_unscored)
+    assert res_unscored[0].severity == 9.0
+    assert res_unscored[1].severity == 3.0
