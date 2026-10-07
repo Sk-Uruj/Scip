@@ -26,9 +26,10 @@ class Finding:
     explanation: str = ""
     extra: dict = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, include_explanation: bool = False) -> dict:
         d = asdict(self)
-        d.pop('explanation', None)
+        if not include_explanation:
+            d.pop('explanation', None)
         return d
 
     def clone(self) -> Finding:

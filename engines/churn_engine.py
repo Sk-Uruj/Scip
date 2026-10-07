@@ -1,15 +1,19 @@
-
+import functools
 import subprocess
+from pathlib import Path
 from typing import List, Dict
 from core.finding import Finding
 from engines.base import Engine
 
+
+@functools.lru_cache(maxsize=32)
 def get_git_churn(repo_path: str) -> Dict[str, int]:
     try:
+        resolved_path = str(Path(repo_path).resolve())
         cmd = ["git", "log", "--name-only", "--format="]
-        output = subprocess.check_output(cmd, cwd=repo_path, text=True, stderr=subprocess.DEVNULL)
+        output = subprocess.check_output(cmd, cwd=resolved_path, text=True, stderr=subprocess.DEVNULL)
         
-        churn_counts = {}
+        churn_counts: Dict[str, int] = {}
         for line in output.splitlines():
             line = line.strip()
             if line:
@@ -21,8 +25,8 @@ def get_git_churn(repo_path: str) -> Dict[str, int]:
     except Exception:
         return {}
 
+
 def normalize_churn(churn_counts: Dict[str, int]) -> Dict[str, float]:
-    
     if not churn_counts:
         return {}
     
