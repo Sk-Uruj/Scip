@@ -27,7 +27,9 @@ class Finding:
     extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop('explanation', None)
+        return d
 
     def clone(self) -> Finding:
         """Return a deep copy of this finding to prevent accidental in-place mutations."""
