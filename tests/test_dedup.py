@@ -378,3 +378,29 @@ def test_unrecognized_cwe_string_triggers_keyword_fallback():
         severity=5.0,
     )
     assert _are_duplicates(f1, f2) is True
+
+
+def test_crypto_hash_cwe327_and_cwe328_compatibility():
+    f1 = Finding(
+        engine="bandit",
+        title="Bandit B324: Use of weak MD5 hash for security",
+        file="helpers.py",
+        line=76,
+        cwe="CWE-327",
+        severity=8.8,
+    )
+    f2 = Finding(
+        engine="crypto",
+        title="Use of broken hash algorithm MD5",
+        file="helpers.py",
+        line=76,
+        cwe="CWE-328",
+        severity=7.0,
+    )
+    assert _are_duplicates(f1, f2) is True
+
+    res = deduplicate_findings([f1, f2])
+    assert len(res) == 1
+    assert res[0].extra.get("corroborated") is True
+    assert set(res[0].extra.get("corroborating_engines")) == {"bandit", "crypto"}
+

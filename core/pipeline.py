@@ -71,6 +71,7 @@ def run_scan(
     include_suppressed: bool = False,
     is_ci: bool = False,
     scoring: bool = True,
+    exclude_tests: bool = False,
 ) -> List[Finding]:
     engines = engines if engines is not None else get_engines(include_suppressed=include_suppressed)
     findings: List[Finding] = []
@@ -123,6 +124,15 @@ def run_scan(
     else:
         active = sorted(active, key=lambda f: (-f.severity, -f.exploitability))
 
+    # 4. Optional: filter out test fixtures
+    if exclude_tests and active:
+        from core.risk_graph import is_test_path
+        pre_count = len(active)
+        active = [f for f in active if not is_test_path(f.file) and getattr(f, "exposure", None) != "TEST"]
+        test_filtered = pre_count - len(active)
+        if test_filtered > 0:
+            print(f"[+] Excluded {test_filtered} test fixture finding(s)", file=sys.stderr)
+
     return active
 
 
@@ -136,17 +146,22 @@ def print_table(findings: List[Finding], engines: Optional[list] = None, show_ri
     else:
         if show_risk and any(f.risk_score > 0 for f in findings):
             sorted_findings = sorted(findings, key=lambda f: (-f.risk_score, -f.severity, -f.exploitability))
-            print(f"\n{'#':>3}  {'RISK':>6}  {'SEV':>4}  {'EXPL':>5}  {'ENGINE':<11} {'LOCATION':<28} TITLE")
-            print("-" * 118)
+            print(f"\n{'#':>3}  {'RISK':>6}  {'SEV':>4}  {'EXPL':>5}  {'REACH':>6}  {'ENGINE':<11} {'LOCATION':<28} TITLE")
+            print("-" * 128)
             for i, f in enumerate(sorted_findings, 1):
                 loc = f"{f.file}:{f.line}" if f.line else f.file
                 if len(loc) > 28:
                     loc = "..." + loc[-25:]
                 title = _ascii(f.title)
-                if len(title) > 60:
-                    title = title[:57] + "..."
+                if f.extra.get("is_seed_fixture") or "seed" in (getattr(f, "fp_reason", "") or "").lower():
+                    title = f"[SEED] {title}"
+                elif getattr(f, "fp_likelihood", None) == "HIGH" or f.extra.get("fp_likelihood") == "HIGH":
+                    title = f"[FP?] {title}"
+                if len(title) > 55:
+                    title = title[:52] + "..."
                 engine_label = f"{f.engine}*" if f.extra.get("corroborated") else f.engine
-                print(f"{i:>3}  {f.risk_score:>6.2f}  {f.severity:>4.1f}  {f.exploitability:>5.2f}  {engine_label:<11} {loc:<28} {title}")
+                reach_str = f.exposure if f.exposure else ("YES" if f.reachable is True else ("NO" if f.reachable is False else "?"))
+                print(f"{i:>3}  {f.risk_score:>6.2f}  {f.severity:>4.1f}  {f.exploitability:>5.2f}  {reach_str:>6}  {engine_label:<11} {loc:<28} {title}")
         else:
             sorted_findings = sorted(findings, key=lambda f: (-f.severity, -f.exploitability))
             print(f"\n{'#':>3}  {'SEV':>4}  {'EXPL':>5}  {'ENGINE':<11} {'LOCATION':<28} TITLE")
@@ -178,6 +193,38 @@ def print_table(findings: List[Finding], engines: Optional[list] = None, show_ri
                 print(f"  [+] {e.name:<12} OK ({detail}{cnt} findings)")
 
 
+def print_attack_paths(findings: List[Finding]) -> None:
+    """Print detailed visual attack paths and remediation hints for reachable findings."""
+    reachable = [f for f in findings if f.extra.get("attack_path")]
+    if not reachable:
+        return
+
+    print("\n" + "=" * 115)
+    print("REACHABLE ATTACK PATHS & REMEDIATION HINTS")
+    print("=" * 115)
+
+    for i, f in enumerate(reachable, 1):
+        loc = f"{f.file}:{f.line}" if f.line else f.file
+        exposure_tag = f.exposure or ("YES" if f.reachable is True else "REACHABLE")
+        print(f"\n[#{i}] {f.title}")
+        print(f"     Location:     {loc}")
+        print(f"     Severity:     {f.severity:.1f} | Risk Score: {f.risk_score:.2f} | Exposure: {exposure_tag}")
+
+        path = f.extra.get("attack_path", [])
+        if path:
+            print("     Attack Path:")
+            for idx, hop in enumerate(path):
+                prefix = "       |--> " if idx > 0 else "       Entry: "
+                indent = "      " + (" " * (idx * 2)) if idx > 0 else ""
+                print(f"{indent}{prefix}{hop}")
+
+        hint = f.fix_hint or f.extra.get("fix_hint") or getattr(f, "fix_hint", "")
+        if hint:
+            print(f"     Remediation:  {hint}")
+        print("-" * 115)
+
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Scan a repository")
     ap.add_argument("path", nargs="?", default=".", help="repository to scan")
@@ -203,6 +250,10 @@ def main(argv=None) -> int:
                     help="fail with exit code 2 if any engine is skipped or encounters errors")
     ap.add_argument("--fail-on", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
                     help="exit with code 1 if active findings meet or exceed this severity")
+    ap.add_argument("--exclude-tests", action="store_true",
+                    help="filter out findings situated in test files and mock fixtures")
+    ap.add_argument("--details", "--show-paths", action="store_true",
+                    help="display detailed attack paths and remediation hints for reachable vulnerabilities")
     ap.add_argument("--output", "-o", metavar="FILE",
                     help="write full JSON to FILE (UTF-8). Use this instead of '>' in PowerShell, "
                          "which saves UTF-16 that many tools cannot read")
@@ -268,6 +319,7 @@ def main(argv=None) -> int:
             include_suppressed=args.include_suppressed,
             is_ci=is_ci,
             scoring=not args.no_scoring,
+            exclude_tests=args.exclude_tests,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -295,6 +347,8 @@ def main(argv=None) -> int:
                 print(f"[!] Engine {e.name} encountered errors: {stats['errors'][:3]}", file=sys.stderr)
     else:
         print_table(findings, engines=engines, show_risk=not args.no_scoring)
+        if args.details:
+            print_attack_paths(findings)
 
     # Severity failure gating
     SEV_THRESHOLDS = {"CRITICAL": 9.0, "HIGH": 7.0, "MEDIUM": 4.0, "LOW": 1.0}

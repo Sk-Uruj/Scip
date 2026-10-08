@@ -138,11 +138,16 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
     # 3. CISA KEV (1.0 if active, 0.0 otherwise)
     s_kev = 1.0 if bool(extra.get("kev")) else 0.0
 
-    # 4. Reachability (1.0 if reachable, 0.0 if unused, 0.5 if unknown/null)
+    # 4. Reachability & Exposure Tier
     reach = getattr(f, "reachable", None)
-    if reach is True:
+    exposure = getattr(f, "exposure", None) or extra.get("exposure")
+    if exposure == "HTTP" or reach is True:
         s_reach = 1.0
-    elif reach is False:
+    elif exposure == "WORKER":
+        s_reach = 0.5
+    elif exposure == "CLI":
+        s_reach = 0.3
+    elif exposure in ("TEST", "DEAD") or reach is False:
         s_reach = 0.0
     else:
         s_reach = 0.5
@@ -177,15 +182,42 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
 
     risk_score = round(max(0.0, min(100.0, 100.0 * (weighted_sum / total_weight))), 2)
 
+    # 8. False Positive & Seed Fixture Damping
+    fp_likely = getattr(f, "fp_likelihood", None) or extra.get("fp_likelihood")
+    is_seed = bool(extra.get("is_seed_fixture") or "seed" in (getattr(f, "fp_reason", "") or "").lower())
+    fp_damped = False
+    damping_factor = 1.0
+    damping_label = "FP Damped"
+
+    if is_seed:
+        # Dev seed credentials in git history (CWE-1188): moderate damping (0.6x)
+        damping_factor = 0.6
+        damping_label = "Seed Damped"
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+    elif fp_likely == "HIGH":
+        # Pure false positives (RFC compliance, DDL schema, safe-by-design): deep damping (0.15x)
+        damping_factor = 0.15
+        damping_label = "FP Damped"
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+
+    reach_label = exposure if exposure else ("YES" if reach is True else ("NO" if reach is False else "?"))
+    reach_info = f"Reach: {s_reach:.1f} (w={w_reach:.2f}, {reach_label}"
+    if extra.get("attack_path"):
+        reach_info += f", hops={len(extra['attack_path'])}"
+    reach_info += ")"
+
+    fp_note = f", {damping_label}: {damping_factor}x ({getattr(f, 'fp_reason', '') or extra.get('fp_reason', '')})" if fp_damped else ""
     explanation = (
         f"Risk Score: {risk_score:.2f}/100 | "
         f"CVSS: {f.severity:.1f} (s={s_cvss:.2f}, w={w_cvss:.2f}), "
         f"{exploit_label} (w={w_epss:.2f}), "
         f"KEV: {int(s_kev)} (w={w_kev:.2f}), "
-        f"Reach: {s_reach:.1f} (w={w_reach:.2f}), "
+        f"{reach_info}, "
         f"Blast: {s_blast:.2f} (w={w_blast:.2f}, count={blast_cnt}), "
         f"Churn: {s_churn:.2f} (w={w_churn:.2f}), "
-        f"Health: {s_health:.2f} (w={w_health:.2f})"
+        f"Health: {s_health:.2f} (w={w_health:.2f}){fp_note}"
     )
 
     f.risk_score = risk_score
@@ -216,8 +248,22 @@ def score_and_sort_findings(findings: List[Finding], repo_path: Optional[str] = 
                 if not matched:
                     f.churn = 0.0
 
-        calculate_blast_radius(findings, repo_path)
+        try:
+            from core.risk_graph import RiskGraph
+            risk_graph = RiskGraph(repo_path).build()
+            risk_graph.analyze_reachability(findings)
+        except Exception as e:
+            log.warning("RiskGraph analysis failed, falling back to basic blast radius: %s", e)
+            calculate_blast_radius(findings, repo_path)
+
         calculate_code_health_penalties(findings, repo_path)
+
+        # Detect and tag safe-by-design / protocol-mandated false positives
+        try:
+            from core.fp_detector import detect_false_positives
+            detect_false_positives(findings, repo_path=repo_path)
+        except Exception as e:
+            log.debug("FP detection error: %s", e)
 
     for f in findings:
         calculate_finding_risk_score(f, weights=weights)

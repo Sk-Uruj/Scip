@@ -63,6 +63,7 @@ CWE_DEFINITIONS: Dict[str, Tuple[str, float]] = {
     "CWE-319": ("Cleartext Transmission of Sensitive Information", 5.0),
     "CWE-326": ("Inadequate Encryption Strength", 6.0),
     "CWE-327": ("Use of a Broken or Risky Cryptographic Algorithm", 7.5),
+    "CWE-328": ("Use of Weak Hash", 7.0),
     "CWE-330": ("Use of Insufficiently Random Values", 6.5),
     "CWE-377": ("Insecure Temporary File", 5.5),
     "CWE-400": ("Uncontrolled Resource Consumption", 4.5),
@@ -76,9 +77,9 @@ CWE_DEFINITIONS: Dict[str, Tuple[str, float]] = {
 
 # Vulnerability Family Compatibility Groups (narrowed to prevent cross-class false merges)
 COMPATIBILITY_FAMILIES = [
-    {"CWE-78", "CWE-95"},            # Command & Eval Injection (B102, B307, B602 & Semgrep injection)
-    {"CWE-326", "CWE-327"},          # Cryptographic issues (weak algorithms & key lengths)
-    {"CWE-259", "CWE-798"},          # Hardcoded passwords & credentials (Bandit B105 & Secrets engine)
+    {"CWE-78", "CWE-95"},                    # Command & Eval Injection (B102, B307, B602 & Semgrep injection)
+    {"CWE-326", "CWE-327", "CWE-328"},      # Cryptographic issues (weak algorithms, hashes & key lengths)
+    {"CWE-259", "CWE-798"},                  # Hardcoded passwords & credentials (Bandit B105 & Secrets engine)
 ]
 
 

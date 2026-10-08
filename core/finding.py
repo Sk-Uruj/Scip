@@ -24,6 +24,9 @@ class Finding:
     code_health_penalty: float = 0.0 # 0-1
     risk_score: float = 0.0
     explanation: str = ""
+    exposure: Optional[str] = None           # "HTTP" | "WORKER" | "CLI" | "TEST" | "DEAD"
+    fp_likelihood: Optional[str] = None      # "HIGH" | "MEDIUM" | "LOW" | None
+    fp_reason: Optional[str] = None
     extra: dict = field(default_factory=dict)
 
     def to_dict(self, include_explanation: bool = False) -> dict:

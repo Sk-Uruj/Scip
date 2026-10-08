@@ -267,3 +267,43 @@ def test_pipeline_no_scoring_opt_out(tmp_path, monkeypatch):
     assert all(f.risk_score == 0.0 for f in res_unscored)
     assert res_unscored[0].severity == 9.0
     assert res_unscored[1].severity == 3.0
+
+
+def test_pipeline_exclude_tests_and_details_cli(tmp_path, monkeypatch, capsys):
+    f_prod = Finding(
+        engine="bandit",
+        title="Prod Vulnerability",
+        file="app.py",
+        line=10,
+        severity=7.5,
+        reachable=True,
+        exposure="HTTP",
+        extra={"attack_path": ["Entrypoint: GET /api [app.py:5]", "app.py:10"]},
+        fix_hint="Validate input",
+    )
+    f_test = Finding(
+        engine="bandit",
+        title="Test Flaw",
+        file="tests/test_foo.py",
+        line=20,
+        severity=5.0,
+    )
+
+    class MockEngine:
+        name = "bandit"
+        stats = {}
+        def is_available(self):
+            return True
+        def scan(self, path):
+            return [f_prod.clone(), f_test.clone()]
+
+    from core.pipeline import main
+    monkeypatch.setattr("core.pipeline.get_engines", lambda **kw: [MockEngine()])
+
+    rc = main([str(tmp_path), "--exclude-tests", "--details"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Excluded 1 test fixture finding(s)" in captured.err
+    assert "REACHABLE ATTACK PATHS & REMEDIATION HINTS" in captured.out
+    assert "Prod Vulnerability" in captured.out
+    assert "Validate input" in captured.out
