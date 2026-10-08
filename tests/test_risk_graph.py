@@ -315,3 +315,166 @@ class AuthService:
         assert "AuthService.authenticate" in f_method.extra["attack_path"][-1]
 
 
+def test_route_calling_nested_calls():
+    """Verify visit_Call recurses through nested calls like wrapper(inner()) or jsonify(process(data))."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        main_code = """
+from fastapi import FastAPI
+from helpers import wrapper, inner
+
+app = FastAPI()
+
+@app.get("/data")
+def data_route():
+    return wrapper(inner())
+"""
+        helpers_code = """
+def wrapper(val):
+    return val
+
+def inner():
+    # Vulnerable logic inside nested call
+    pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(main_code)
+        with open(os.path.join(tmpdir, "helpers.py"), "w") as f:
+            f.write(helpers_code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        f_inner = Finding(
+            engine="bandit",
+            title="InnerVulnerability",
+            file="helpers.py",
+            line=6,
+            severity=8.0,
+        )
+        rg.analyze_reachability([f_inner])
+
+        assert f_inner.reachable is True
+        assert f_inner.exposure == "HTTP"
+        assert len(f_inner.extra.get("attack_path", [])) >= 2
+        assert "inner" in f_inner.extra["attack_path"][-1]
+
+
+def test_annotated_depends_detection():
+    """Verify Depends inside Annotated[Session, Depends(get_db)] creates a CALLS edge and reaches get_db."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        main_code = """
+from fastapi import FastAPI, Depends
+from typing import Annotated
+from db import get_db
+
+app = FastAPI()
+
+@app.get("/users")
+def get_users(db: Annotated[object, Depends(get_db)]):
+    return []
+"""
+        db_code = """
+def get_db():
+    # Database connection logic
+    pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(main_code)
+        with open(os.path.join(tmpdir, "db.py"), "w") as f:
+            f.write(db_code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        f_db = Finding(
+            engine="bandit",
+            title="DBExposure",
+            file="db.py",
+            line=3,
+            severity=7.0,
+        )
+        rg.analyze_reachability([f_db])
+
+        assert f_db.reachable is True
+        assert f_db.exposure == "HTTP"
+        assert any("get_db" in p for p in f_db.extra.get("attack_path", []))
+
+
+def test_startup_hook_exposure_tier():
+    """Verify startup hooks (on_event, lifespan) produce STARTUP exposure tier and startup reach score."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        main_code = """
+from fastapi import FastAPI
+from worker import init_cache
+
+app = FastAPI()
+
+@app.on_event("startup")
+def startup_hook():
+    init_cache()
+"""
+        worker_code = """
+def init_cache():
+    # Cache initialization flaw
+    pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(main_code)
+        with open(os.path.join(tmpdir, "worker.py"), "w") as f:
+            f.write(worker_code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        f_cache = Finding(
+            engine="bandit",
+            title="InsecureCache",
+            file="worker.py",
+            line=3,
+            severity=6.0,
+        )
+        rg.analyze_reachability([f_cache])
+
+        assert f_cache.reachable is True
+        assert f_cache.exposure == "STARTUP"
+        assert len(f_cache.extra.get("attack_path", [])) >= 2
+        assert "STARTUP" in f_cache.extra["attack_path"][0]
+
+
+def test_heuristic_edge_tagged_and_formatted():
+    """Verify method resolution on object instances tags edge confidence as heuristic and formats it in attack_path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        main_code = """
+from fastapi import FastAPI
+from service import ProcessService
+
+app = FastAPI()
+
+@app.post("/process")
+def process_route():
+    svc = ProcessService()
+    svc.run()
+"""
+        service_code = """
+class ProcessService:
+    def run(self):
+        pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(main_code)
+        with open(os.path.join(tmpdir, "service.py"), "w") as f:
+            f.write(service_code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        f_run = Finding(
+            engine="bandit",
+            title="Flaw",
+            file="service.py",
+            line=3,
+            severity=7.0,
+        )
+        rg.analyze_reachability([f_run])
+
+        assert f_run.reachable is True
+        path = f_run.extra.get("attack_path", [])
+        assert any("(heuristic)" in p for p in path)
+
+

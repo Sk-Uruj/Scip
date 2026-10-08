@@ -274,3 +274,19 @@ def test_serialized_report_contains_no_raw_secrets(tmp_path):
         assert mv.startswith("ghp_") or mv == "********"
         assert raw_secret[4:] not in mv
 
+
+def test_committed_secret_in_tests_has_repo_reach():
+    """Secrets committed in tests/ have exposure=TEST but must score reachability using secret_repo_reach, not 0.0."""
+    f = Finding(
+        engine="secrets",
+        title="Live API Key in Tests",
+        file="tests/test_client.py",
+        line=10,
+        cwe="CWE-798",
+        severity=9.0,
+        exposure="TEST",
+    )
+    calculate_finding_risk_score(f)
+    assert "s=0.80" in f.explanation
+    assert f.risk_score > 30.0
+

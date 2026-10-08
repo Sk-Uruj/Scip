@@ -60,9 +60,34 @@ DEMO_WORDLIST = {
     "testpass", "demo", "dev", "123456", "secret", "root", "guest", "default", "test"
 }
 
-GATED_SEED_PATTERNS = [
-    re.compile(r"(--seed|if\s+DEBUG|if\s+.*env.*(dev|test)|if\s+not\s+.*count|SELECT\s+COUNT|os\.getenv\(['\"](DEBUG|ENV)['\"]\))", re.IGNORECASE)
+NEGATIVE_GATE_PATTERNS = [
+    re.compile(r"(!=\s*[\"'](?:dev|test|local)[\"'])", re.IGNORECASE),
+    re.compile(r"(not\s+in\s*[\(\[][^)]*[\"'](?:dev|test|local)[\"'])", re.IGNORECASE),
+    re.compile(r"(\bif\s+not\s+.*(?:DEBUG|debug|ENV|env)\b)", re.IGNORECASE),
+    re.compile(r"((?:DEBUG|debug)\s*(?:==|\bis\b)\s*False\b)", re.IGNORECASE),
+    re.compile(r"((?:DEBUG|debug)\s*!=\s*(?:1|True|true)\b)", re.IGNORECASE),
+    re.compile(r"(os\.(?:environ\.get|getenv)\([\"'](?:DEBUG|ENV)[\"']\)\s*!=\s*[\"']?(?:1|true|dev|test)[\"']?)", re.IGNORECASE),
 ]
+
+POSITIVE_GATE_PATTERNS = [
+    re.compile(r"--seed\b", re.IGNORECASE),
+    re.compile(r"\bif\s+(?:DEBUG|debug)\b", re.IGNORECASE),
+    re.compile(r"\bif\s+.*env.*(?:==|\bin\b)\s*[\"'](dev|test|local|sample)[\"']", re.IGNORECASE),
+    re.compile(r"os\.(?:environ\.get|getenv)\([\"'](DEBUG|ENV)[\"']\)", re.IGNORECASE),
+    re.compile(r"SELECT\s+COUNT\b", re.IGNORECASE),
+    re.compile(r"\bif\s+not\s+.*count\b", re.IGNORECASE),
+]
+
+
+def _is_dev_gated(block_text: str) -> bool:
+    """Evaluate whether an enclosing block is gated for dev/seed execution with correct polarity."""
+    if not block_text:
+        return False
+    # Negative polarity checks immediately disqualify the gate (e.g. if env != "dev" means prod!)
+    if any(p.search(block_text) for p in NEGATIVE_GATE_PATTERNS):
+        return False
+    return any(p.search(block_text) for p in POSITIVE_GATE_PATTERNS)
+
 
 CI_AND_CONFIG_FILES = (
     "docker-compose", ".env", "jenkinsfile", ".gitlab-ci", "workflow", "config.", "settings."
@@ -145,15 +170,43 @@ def _get_enclosing_block_text(file_lines: List[str], line_no: Optional[int], ful
     return "".join(file_lines[s_idx:e_idx])
 
 
+SQL_KEYWORDS = {
+    "select", "insert", "update", "delete", "alter", "create", "drop",
+    "pragma", "from", "where", "table", "into", "values", "set", "join"
+}
+
+
+def _is_log_or_print_call(call_node: ast.Call) -> bool:
+    """Check if a Call node is a logging or print statement."""
+    func = call_node.func
+    if isinstance(func, ast.Name):
+        return func.id.lower() in ("print", "log", "logger", "logging", "debug", "info", "warn", "warning", "error", "critical")
+    elif isinstance(func, ast.Attribute):
+        if func.attr.lower() in ("print", "log", "logger", "logging", "debug", "info", "warn", "warning", "error", "critical"):
+            return True
+        if isinstance(func.value, ast.Name) and func.value.id.lower() in ("log", "logger", "logging", "sys"):
+            return True
+    return False
+
+
+def _contains_sql_keyword(text: str) -> bool:
+    """Check if a string contains any SQL keyword as a word token."""
+    tokens = set(re.findall(r"[a-zA-Z]+", text.lower()))
+    return bool(tokens & SQL_KEYWORDS)
+
+
 def check_ast_sql_variable_safety(
     file_path: Optional[str],
     line_no: Optional[int],
     evidence: str
 ) -> bool:
-    """Resolve SQL interpolated variables using AST backward walk.
-    
-    A literal, literal tuple/dict lookup, or enum member evaluates as safe (FP).
-    Any external/request input or unresolved variable evaluates as unsafe (not FP).
+    """Resolve SQL interpolated variables using full AST semantic evaluation.
+
+    Fail-closed policy:
+    - Pure string constants, static DDL, whitelisted literal dict lookups, or Enums evaluate as safe (FP).
+    - Unresolved variables, string concatenations with external input, .format(kw=val),
+      request attributes (e.g. request.args['col'], flask.request.args, request.json.column),
+      or imported helper objects evaluate as unsafe (not FP).
     """
     code_text = ""
     target_line = line_no
@@ -180,72 +233,129 @@ def check_ast_sql_variable_safety(
         except Exception:
             return False
 
-    # Find candidate SQL formatting or execute nodes
-    candidate_nodes = []
+    # 1. Identify the SQL query node in AST
+    db_methods = {"execute", "executemany", "execute_sql", "raw", "cursor_execute"}
+    candidate_executes: List[ast.Call] = []
+    candidate_sql_nodes: List[Tuple[int, ast.AST]] = []
+
     for node in ast.walk(tree):
-        if isinstance(node, (ast.JoinedStr, ast.Call, ast.BinOp)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.lower() in db_methods:
+            if node.args:
+                lineno = getattr(node, "lineno", None)
+                dist = abs(lineno - target_line) if (target_line and lineno) else 0
+                if dist <= 6:
+                    candidate_executes.append(node)
+
+        elif isinstance(node, (ast.JoinedStr, ast.BinOp, ast.Call)):
+            if isinstance(node, ast.Call) and _is_log_or_print_call(node):
+                continue
             lineno = getattr(node, "lineno", None)
-            if target_line is not None and lineno is not None:
-                if abs(lineno - target_line) <= 4:
-                    candidate_nodes.append(node)
-            else:
-                candidate_nodes.append(node)
+            dist = abs(lineno - target_line) if (target_line and lineno) else 0
+            if dist <= 6:
+                has_sql = False
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        if _contains_sql_keyword(sub.value):
+                            has_sql = True
+                            break
+                prio = dist if has_sql else (dist + 10)
+                candidate_sql_nodes.append((prio, node))
 
-    if not candidate_nodes:
-        if not re.search(r"\{|\%s|\%d|\.format\(", evidence):
-            return True
+    target_sql_expr: Optional[ast.AST] = None
+    if candidate_executes:
+        candidate_executes.sort(key=lambda c: abs((getattr(c, "lineno", 0) or 0) - (target_line or 0)))
+        target_sql_expr = candidate_executes[0].args[0]
+    elif candidate_sql_nodes:
+        candidate_sql_nodes.sort(key=lambda item: item[0])
+        target_sql_expr = candidate_sql_nodes[0][1]
+
+    if target_sql_expr is None:
+        if re.search(r"\{|\%s|\%d|\.format\(|\+", evidence):
+            return False
         return False
 
-    sql_node = None
-    for n in candidate_nodes:
-        if isinstance(n, ast.JoinedStr):
-            sql_node = n
-            break
-        elif isinstance(n, ast.Call) and getattr(getattr(n, "func", None), "attr", "") == "execute":
-            sql_node = n
-            break
-    if not sql_node:
-        sql_node = candidate_nodes[0]
-
-    variables_to_check: List[Tuple[str, int]] = []
-
-    if isinstance(sql_node, ast.JoinedStr):
-        for val in sql_node.values:
-            if isinstance(val, ast.FormattedValue):
-                for sub in ast.walk(val.value):
-                    if isinstance(sub, ast.Name):
-                        variables_to_check.append((sub.id, getattr(val, "lineno", target_line or 1)))
-    elif isinstance(sql_node, ast.Call):
-        for arg in sql_node.args:
-            if isinstance(arg, ast.JoinedStr):
-                for val in arg.values:
-                    if isinstance(val, ast.FormattedValue):
-                        for sub in ast.walk(val.value):
-                            if isinstance(sub, ast.Name):
-                                variables_to_check.append((sub.id, getattr(val, "lineno", target_line or 1)))
-            elif isinstance(arg, ast.Call) and getattr(getattr(arg, "func", None), "attr", "") == "format":
-                for f_arg in arg.args:
-                    for sub in ast.walk(f_arg):
-                        if isinstance(sub, ast.Name):
-                            variables_to_check.append((sub.id, getattr(f_arg, "lineno", target_line or 1)))
-    elif isinstance(sql_node, ast.BinOp) and isinstance(sql_node.op, ast.Mod):
-        for sub in ast.walk(sql_node.right):
-            if isinstance(sub, ast.Name):
-                variables_to_check.append((sub.id, getattr(sub, "lineno", target_line or 1)))
-
-    if not variables_to_check:
-        return True
-
-    def _is_constant_or_seq_of_constants(elem: ast.AST) -> bool:
-        if isinstance(elem, ast.Constant):
+    # 2. Fully evaluate safety of target_sql_expr
+    def _eval_expr_safety(expr: ast.AST, cur_line: int, visited: Set[str]) -> bool:
+        if isinstance(expr, ast.Constant):
             return True
-        if isinstance(elem, ast.Name):
-            return elem.id.isupper()
-        if isinstance(elem, (ast.List, ast.Tuple, ast.Set)):
-            return all(_is_constant_or_seq_of_constants(x) for x in elem.elts)
+
+        elif isinstance(expr, ast.JoinedStr):
+            for v in expr.values:
+                if isinstance(v, ast.FormattedValue):
+                    if not _eval_expr_safety(v.value, getattr(v, "lineno", cur_line), visited):
+                        return False
+            return True
+
+        elif isinstance(expr, ast.BinOp):
+            if isinstance(expr.op, ast.Add):
+                return (_eval_expr_safety(expr.left, cur_line, visited)
+                        and _eval_expr_safety(expr.right, cur_line, visited))
+            elif isinstance(expr.op, ast.Mod):
+                if isinstance(expr.right, (ast.Tuple, ast.List)):
+                    return all(_eval_expr_safety(e, cur_line, visited) for e in expr.right.elts)
+                return _eval_expr_safety(expr.right, cur_line, visited)
+            return False
+
+        elif isinstance(expr, ast.Call):
+            if isinstance(expr.func, ast.Attribute):
+                method = expr.func.attr
+                if method == "format":
+                    if not _eval_expr_safety(expr.func.value, cur_line, visited):
+                        return False
+                    if not all(_eval_expr_safety(a, cur_line, visited) for a in expr.args):
+                        return False
+                    if not all(_eval_expr_safety(kw.value, cur_line, visited) for kw in expr.keywords):
+                        return False
+                    return True
+                elif method in ("lower", "upper", "strip", "lstrip", "rstrip"):
+                    return _eval_expr_safety(expr.func.value, cur_line, visited)
+                elif method == "get":
+                    if not _eval_expr_safety(expr.func.value, cur_line, visited):
+                        return False
+                    if len(expr.args) > 1 and not _eval_expr_safety(expr.args[1], cur_line, visited):
+                        return False
+                    return True
+            return False
+
+        elif isinstance(expr, ast.Attribute):
+            chain = []
+            curr = expr
+            while isinstance(curr, ast.Attribute):
+                chain.append(curr.attr.lower())
+                curr = curr.value
+            if isinstance(curr, ast.Name):
+                chain.append(curr.id.lower())
+            
+            if any(k in chain for k in ("request", "req", "params", "args", "query", "json", "data", "headers", "cookies", "flask", "django")):
+                return False
+
+            if isinstance(curr, ast.Name):
+                root_id = curr.id
+                if root_id.isupper() or root_id.endswith("Enum") or (root_id[0].isupper() and expr.attr.isupper()):
+                    return True
+            return False
+
+        elif isinstance(expr, ast.Subscript):
+            if isinstance(expr.value, ast.Dict):
+                return all(isinstance(v, ast.Constant) for v in expr.value.values)
+            elif isinstance(expr.value, (ast.List, ast.Tuple)):
+                return all(isinstance(e, ast.Constant) for e in expr.value.elts)
+            elif isinstance(expr.value, ast.Name):
+                return _eval_var_safety(expr.value.id, cur_line, visited.copy(), require_container_constants=True)
+            return False
+
+        elif isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+            return all(_eval_expr_safety(e, cur_line, visited) for e in expr.elts)
+
+        elif isinstance(expr, ast.Dict):
+            return all(_eval_expr_safety(v, cur_line, visited) for v in expr.values)
+
+        elif isinstance(expr, ast.Name):
+            return _eval_var_safety(expr.id, cur_line, visited.copy())
+
         return False
 
-    def _is_var_safe(v_name: str, use_line: int, visited: Set[str]) -> bool:
+    def _eval_var_safety(v_name: str, use_line: int, visited: Set[str], require_container_constants: bool = False) -> bool:
         if v_name in visited:
             return False
         visited.add(v_name)
@@ -275,79 +385,70 @@ def check_ast_sql_variable_safety(
 
         if not found_def:
             for node in ast.walk(tree):
-                if isinstance(node, (ast.Import, ast.ImportFrom)):
-                    for alias in node.names:
-                        as_name = alias.asname or alias.name
-                        if as_name == v_name:
-                            return True
+                if isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        for sub in ast.walk(t):
+                            if isinstance(sub, ast.Name) and sub.id == v_name:
+                                found_def = (node, getattr(node, "lineno", 0))
+                                break
+                    if found_def:
+                        break
+
+        if not found_def:
+            # FAIL-CLOSED: Imported names or function parameters are UNTRUSTED
             return False
 
         def_node, def_line = found_def
 
         if isinstance(def_node, ast.Assign):
+            if require_container_constants:
+                val = def_node.value
+                if isinstance(val, ast.Dict):
+                    return all(isinstance(v, ast.Constant) for v in val.values)
+                elif isinstance(val, (ast.List, ast.Tuple)):
+                    return all(isinstance(e, ast.Constant) for e in val.elts)
+                return False
             return _eval_expr_safety(def_node.value, def_line, visited)
+
         elif isinstance(def_node, ast.AnnAssign):
             if def_node.value:
                 return _eval_expr_safety(def_node.value, def_line, visited)
             return False
+
         elif isinstance(def_node, ast.For):
-            return _eval_iter_safety(def_node.iter, def_line, visited)
-        return False
+            iter_node = def_node.iter
+            iter_items = None
+            if isinstance(iter_node, (ast.List, ast.Tuple)):
+                iter_items = iter_node.elts
+            elif isinstance(iter_node, ast.Name):
+                for stmt in ast.walk(tree):
+                    if isinstance(stmt, ast.Assign):
+                        for t in stmt.targets:
+                            if isinstance(t, ast.Name) and t.id == iter_node.id:
+                                if isinstance(stmt.value, (ast.List, ast.Tuple)):
+                                    iter_items = stmt.value.elts
+                                break
+            if not iter_items:
+                return False
 
-    def _eval_expr_safety(expr: ast.AST, cur_line: int, visited: Set[str]) -> bool:
-        if isinstance(expr, ast.Constant):
-            return True
-        elif isinstance(expr, ast.JoinedStr):
-            for v in expr.values:
-                if isinstance(v, ast.FormattedValue):
-                    for sub in ast.walk(v.value):
-                        if isinstance(sub, ast.Name):
-                            if not _is_var_safe(sub.id, cur_line, visited.copy()):
-                                return False
-            return True
-        elif isinstance(expr, ast.Attribute):
-            if isinstance(expr.value, ast.Name):
-                val_name = expr.value.id
-                if val_name.isupper() or val_name[0].isupper() or "Enum" in val_name:
-                    return True
-            elif isinstance(expr.value, ast.Attribute):
+            if isinstance(def_node.target, ast.Name) and def_node.target.id == v_name:
+                return all(isinstance(it, ast.Constant) for it in iter_items)
+            elif isinstance(def_node.target, (ast.Tuple, ast.List)):
+                target_names = [sub.id for sub in def_node.target.elts if isinstance(sub, ast.Name)]
+                if v_name not in target_names:
+                    return False
+                idx = target_names.index(v_name)
+                for item in iter_items:
+                    if isinstance(item, (ast.Tuple, ast.List)) and idx < len(item.elts):
+                        if not isinstance(item.elts[idx], ast.Constant):
+                            return False
+                    else:
+                        return False
                 return True
-            return False
-        elif isinstance(expr, ast.Subscript):
-            if isinstance(expr.value, ast.Dict):
-                return all(isinstance(v, ast.Constant) for v in expr.value.values)
-            elif isinstance(expr.value, (ast.List, ast.Tuple)):
-                return all(_is_constant_or_seq_of_constants(elt) for elt in expr.value.elts)
-            elif isinstance(expr.value, ast.Name):
-                return _is_var_safe(expr.value.id, cur_line, visited.copy())
-            return False
-        elif isinstance(expr, ast.Dict):
-            return all(isinstance(v, ast.Constant) for v in expr.values)
-        elif isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
-            return all(_is_constant_or_seq_of_constants(elt) for elt in expr.elts)
-        elif isinstance(expr, ast.Call):
-            if isinstance(expr.func, ast.Attribute):
-                if expr.func.attr in ("lower", "upper", "strip"):
-                    return _eval_expr_safety(expr.func.value, cur_line, visited)
-                elif expr.func.attr == "get" and isinstance(expr.func.value, ast.Name):
-                    return _is_var_safe(expr.func.value.id, cur_line, visited.copy())
-            return False
-        elif isinstance(expr, ast.Name):
-            return _is_var_safe(expr.id, cur_line, visited.copy())
+
         return False
 
-    def _eval_iter_safety(iter_expr: ast.AST, cur_line: int, visited: Set[str]) -> bool:
-        if isinstance(iter_expr, (ast.List, ast.Tuple)):
-            return all(_is_constant_or_seq_of_constants(elt) for elt in iter_expr.elts)
-        elif isinstance(iter_expr, ast.Name):
-            return _is_var_safe(iter_expr.id, cur_line, visited.copy())
-        return False
-
-    for var_name, var_line in variables_to_check:
-        if not _is_var_safe(var_name, var_line, set()):
-            return False
-
-    return True
+    return _eval_expr_safety(target_sql_expr, target_line or 1, set())
 
 
 def is_provider_format_secret(f: Finding, line_text: str = "") -> bool:
@@ -401,14 +502,19 @@ def _detect_single_finding_fp(
 
     # 1. Test suite mock passwords / secret fixtures
     # Exempt provider-format keys (e.g. AKIA...) and damp only generic passwords
-    if is_test_path(f.file) or f.exposure == "TEST":
-        if f.cwe in ("CWE-259", "CWE-798") or f.engine in ("secrets", "bandit"):
-            if not is_provider_format_secret(f, line_text):
-                f.fp_likelihood = "HIGH"
-                f.fp_reason = "Mock test credential in test suite"
-                f.extra["fp_likelihood"] = f.fp_likelihood
-                f.extra["fp_reason"] = f.fp_reason
-                return
+    is_test = is_test_path(f.file) or f.exposure == "TEST"
+    is_cred = (
+        f.cwe in ("CWE-259", "CWE-798")
+        or f.engine == "secrets"
+        or (f.engine == "bandit" and (f.cwe in ("CWE-259", "CWE-798") or any(b in (f.title or "") for b in ("B105", "B106", "B107"))))
+    )
+    if is_test and is_cred:
+        if not is_provider_format_secret(f, line_text):
+            f.fp_likelihood = "HIGH"
+            f.fp_reason = "Mock test credential in test suite"
+            f.extra["fp_likelihood"] = f.fp_likelihood
+            f.extra["fp_reason"] = f.fp_reason
+            return
 
     # 2. Database bootstrap seed credentials / demo fixtures (CWE-1188) with mandatory env and cross guards
     is_seed_file = (
@@ -455,7 +561,7 @@ def _detect_single_finding_fp(
                 g_demo = True
                 break
 
-        # Guard 3: Gating guard - Scoped strictly to the enclosing seed block/function
+        # Guard 3: Gating guard - Scoped strictly to the enclosing seed block/function with polarity validation
         is_pure_fixture_dir = (
             norm_file.startswith("seeds/") or "/seeds/" in norm_file
             or norm_file.startswith("fixtures/") or "/fixtures/" in norm_file
@@ -465,7 +571,7 @@ def _detect_single_finding_fp(
             g_gate = True
         else:
             block_text = _get_enclosing_block_text(file_lines, f.line, full_path)
-            g_gate = any(p.search(block_text) for p in GATED_SEED_PATTERNS)
+            g_gate = _is_dev_gated(block_text)
 
         # Guard 4: Cross-file guard - In-memory secret value search across production files
         valid_candidates = [
@@ -492,27 +598,29 @@ def _detect_single_finding_fp(
 
         guards_passed = sum(1 for g in (g_env, g_demo, g_gate, g_cross) if g)
 
-        # Environment and cross-file checks are strictly mandatory
-        required = g_env and g_cross
+        # STRICT REQUIREMENTS:
+        # 1. Environment (g_env) and cross-file (g_cross) checks are strictly mandatory.
+        # 2. Demo-value guard (g_demo) is strictly required for ANY damping.
+        #    A random/production-like password behind DEBUG is still a readable committed secret.
+        #    Only g_demo guarantees the value itself is a throwaway mock/demo fixture.
         if (matches_seed_var or is_seed_file):
-            if required and g_demo and g_gate:
-                f.fp_likelihood = "HIGH"
-                f.fp_reason = "Database bootstrap seed credentials / demo fixture (all 4 guards passed)"
-                f.extra["fp_likelihood"] = f.fp_likelihood
-                f.extra["fp_reason"] = f.fp_reason
-                f.extra["seed_classification"] = "SEED"
-                f.extra["damping_multiplier"] = 0.20
-                f.extra["guard_note"] = f"Guarded seed fixture (4/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
-                return
-            elif required and (g_demo or g_gate):
-                f.fp_likelihood = "MEDIUM"
-                f.fp_reason = "Database bootstrap fixture (mild damping: 3/4 guards passed)"
-                f.extra["fp_likelihood"] = f.fp_likelihood
-                f.extra["fp_reason"] = f.fp_reason
-                f.extra["seed_classification"] = "SEED"
-                f.extra["damping_multiplier"] = 0.60
-                f.extra["guard_note"] = f"Partially guarded seed fixture (3/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
-                return
+            if g_env and g_cross and g_demo:
+                if g_gate:
+                    f.fp_likelihood = "HIGH"
+                    f.fp_reason = "Database bootstrap seed credentials / demo fixture (all 4 guards passed)"
+                    f.extra["fp_likelihood"] = f.fp_likelihood
+                    f.extra["fp_reason"] = f.fp_reason
+                    f.extra["seed_classification"] = "SEED_FULL"
+                    f.extra["guard_note"] = f"Guarded seed fixture (4/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
+                    return
+                else:
+                    f.fp_likelihood = "MEDIUM"
+                    f.fp_reason = "Database bootstrap fixture (mild damping: 3/4 guards passed, missing runtime gate)"
+                    f.extra["fp_likelihood"] = f.fp_likelihood
+                    f.extra["fp_reason"] = f.fp_reason
+                    f.extra["seed_classification"] = "SEED_PARTIAL"
+                    f.extra["guard_note"] = f"Partially guarded seed fixture (3/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
+                    return
             else:
                 f.extra["seed_classification"] = "NOT_SEED"
                 f.extra["damping_multiplier"] = 1.0
@@ -544,7 +652,13 @@ def _detect_single_finding_fp(
             return
 
     # 4. Dynamic SQL: AST backward walk verification
-    if f.cwe == "CWE-89" or "sql" in combined_text.lower() or "B608" in (f.title or ""):
+    is_sql_finding = (
+        f.cwe == "CWE-89"
+        or "B608" in (f.title or "")
+        or "B608" in (getattr(f, "id", "") or "")
+        or (f.engine == "semgrep" and "sql" in (f.extra.get("check_id") or "").lower())
+    )
+    if is_sql_finding:
         is_safe = check_ast_sql_variable_safety(full_path, f.line, evidence)
         if is_safe:
             is_ddl = any(p.search(evidence) for p in DDL_SQL_PATTERNS)

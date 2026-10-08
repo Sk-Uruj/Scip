@@ -55,6 +55,7 @@ class ScoringConfig:
     secret_repo_reach: float = 0.80        # Exposure reach weight for secrets in working tree (0.0 to 1.0)
     secret_hist_reach: float = 0.50        # Exposure reach weight for secrets in git history (0.0 to 1.0)
     worker_reach: float = 0.70             # Exposure reach weight for background worker tasks (0.0 to 1.0)
+    startup_reach: float = 0.40            # Exposure reach weight for startup/lifecycle hooks (0.0 to 1.0)
     cli_reach: float = 0.30                # Exposure reach weight for CLI tools (0.0 to 1.0)
     internal_reach: float = 0.20           # Exposure reach weight for internal production code (0.0 to 1.0)
     unknown_reach: float = 0.50            # Exposure reach weight when reachability is indeterminate (0.0 to 1.0)
@@ -73,6 +74,8 @@ class ScoringConfig:
             raise ValueError(f"secret_hist_reach must be between 0.0 and 1.0, got {self.secret_hist_reach}")
         if not (0.0 <= self.worker_reach <= 1.0):
             raise ValueError(f"worker_reach must be between 0.0 and 1.0, got {self.worker_reach}")
+        if not (0.0 <= self.startup_reach <= 1.0):
+            raise ValueError(f"startup_reach must be between 0.0 and 1.0, got {self.startup_reach}")
         if not (0.0 <= self.cli_reach <= 1.0):
             raise ValueError(f"cli_reach must be between 0.0 and 1.0, got {self.cli_reach}")
         if not (0.0 <= self.internal_reach <= 1.0):
@@ -198,11 +201,18 @@ def calculate_finding_risk_score(
         s_reach = config.secret_hist_reach
     elif exposure == "WORKER":
         s_reach = config.worker_reach
+    elif exposure == "STARTUP":
+        s_reach = config.startup_reach
     elif exposure == "CLI":
         s_reach = config.cli_reach
     elif exposure == "INTNL":
         s_reach = config.internal_reach
-    elif exposure in ("TEST", "DEAD", "NONE"):
+    elif exposure == "TEST":
+        if f.engine == "secrets" or f.cwe in ("CWE-259", "CWE-798"):
+            s_reach = config.secret_repo_reach
+        else:
+            s_reach = 0.0
+    elif exposure in ("DEAD", "NONE"):
         s_reach = 0.0
     elif exposure == "UNKNOWN" or reach is None:
         s_reach = config.unknown_reach
@@ -264,12 +274,24 @@ def calculate_finding_risk_score(
     damping_factor = 1.0
     damping_label = "FP Damped"
 
+    seed_class = extra.get("seed_classification")
     d_mult = extra.get("damping_multiplier")
-    if d_mult is not None and float(d_mult) < 1.0:
+
+    if seed_class == "SEED_FULL":
+        damping_factor = config.fp_damping_factor
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped"
+    elif seed_class == "SEED_PARTIAL":
+        damping_factor = config.fp_med_damping
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped"
+    elif d_mult is not None and float(d_mult) < 1.0:
         damping_factor = float(d_mult)
         risk_score = round(risk_score * damping_factor, 2)
         fp_damped = True
-        damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
+        damping_label = "Seed Damped" if seed_class in ("SEED", "SEED_FULL", "SEED_PARTIAL") else "FP Damped"
     elif fp_likely == "HIGH":
         damping_factor = config.fp_damping_factor
         risk_score = round(risk_score * damping_factor, 2)
@@ -279,7 +301,7 @@ def calculate_finding_risk_score(
         damping_factor = config.fp_med_damping
         risk_score = round(risk_score * damping_factor, 2)
         fp_damped = True
-        damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
+        damping_label = "FP Damped"
 
     reach_label = exposure if exposure else ("YES" if reach is True else ("NO" if reach is False else "?"))
     reach_info = f"Exposure: {reach_label} (s={s_reach:.2f}, w={w_reach:.2f}"

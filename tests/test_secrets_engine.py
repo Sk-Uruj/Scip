@@ -567,3 +567,36 @@ def test_uuid_not_flagged_as_high_entropy(tmp_path):
     found = scan(tmp_path, use_entropy=True)
     assert not any(f.extra.get("rule") == "high-entropy-string" for f in found)
 
+
+def test_secret_fingerprint_stable_across_line_shifts(tmp_path):
+    """Ensure secret structural fingerprint is stable when code above shifts by multiple lines."""
+    code_a = 'db_password = "verySecretPassword123!"\n'
+    write(tmp_path, "db.py", code_a)
+    findings_a = scan(tmp_path)
+    assert len(findings_a) == 1
+    fp_a = findings_a[0].extra["fingerprint"]
+    assert fp_a
+
+    # Add 15 lines of comments above the secret
+    comments = "\n".join(f"# comment line {i}" for i in range(15))
+    code_b = comments + "\n" + code_a
+    write(tmp_path, "db.py", code_b)
+    findings_b = scan(tmp_path)
+    assert len(findings_b) == 1
+    fp_b = findings_b[0].extra["fingerprint"]
+
+    # Fingerprint MUST remain identical despite line shifting
+    assert findings_b[0].line != findings_a[0].line
+    assert fp_a == fp_b
+
+
+def test_match_has_col_offset(tmp_path):
+    """Ensure Match dataclass defines and populates col_offset."""
+    from engines.secrets_engine import scan_lines
+    lines = [(1, 'token = "glpat-abcdef12345678901234"')]
+    matches = scan_lines(lines, "token.py")
+    assert len(matches) >= 1
+    m = matches[0]
+    assert hasattr(m, "col_offset")
+    assert m.col_offset > 0
+

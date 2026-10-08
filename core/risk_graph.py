@@ -210,7 +210,10 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 dec_str = dec.id
 
             dec_lower = dec_str.lower()
-            if any(k in dec_lower for k in ("app.get", "app.post", "app.put", "app.delete", "app.route", "router.", "bp.route", "on_event", "lifespan")):
+            if any(k in dec_lower for k in ("on_event", "lifespan")):
+                entrypoint_type = "startup"
+                break
+            elif any(k in dec_lower for k in ("app.get", "app.post", "app.put", "app.delete", "app.route", "router.", "bp.route")):
                 entrypoint_type = "fastapi_or_flask"
                 break
             elif "click.command" in dec_lower or "app.command" in dec_lower:
@@ -249,7 +252,7 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             )
             self.graph.add_edge(ep_id, func_id, kind="EXPOSES")
 
-        # Connect FastAPI Depends(...) in argument defaults
+        # Connect FastAPI Depends(...) in argument defaults or Annotated[...]
         args_node = getattr(node, "args", None)
         if args_node:
             all_defaults = [d for d in getattr(args_node, "defaults", []) if d] + [d for d in getattr(args_node, "kw_defaults", []) if d]
@@ -257,21 +260,42 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 if isinstance(d, ast.Call):
                     func_id_name = getattr(d.func, "id", "") or getattr(d.func, "attr", "")
                     if func_id_name == "Depends" and d.args:
-                        dep_target = self._resolve_callee(d.args[0])
+                        dep_target, _ = self._resolve_callee(d.args[0])
                         if dep_target:
                             self.graph.add_edge(func_id, dep_target, kind="CALLS")
 
+            # Check parameter type annotations: Annotated[Session, Depends(get_db)]
+            all_param_args = getattr(args_node, "args", []) + getattr(args_node, "kwonlyargs", [])
+            for p_arg in all_param_args:
+                ann = getattr(p_arg, "annotation", None)
+                if ann:
+                    for sub in ast.walk(ann):
+                        if isinstance(sub, ast.Call):
+                            call_name = getattr(sub.func, "id", "") or getattr(sub.func, "attr", "")
+                            if call_name == "Depends" and sub.args:
+                                dep_target, _ = self._resolve_callee(sub.args[0])
+                                if dep_target:
+                                    self.graph.add_edge(func_id, dep_target, kind="CALLS")
+
     def visit_Call(self, node: ast.Call):
         if self.current_function:
-            callee_id = self._resolve_callee(node.func)
+            callee_id, is_heuristic = self._resolve_callee(node.func)
             if callee_id:
-                self.graph.add_edge(self.current_function, callee_id, kind="CALLS")
+                edge_attrs = {"kind": "CALLS"}
+                if is_heuristic:
+                    edge_attrs["confidence"] = "heuristic"
+                self.graph.add_edge(self.current_function, callee_id, **edge_attrs)
             # Resolve Thread(target=...), add_job(func=...), etc.
             for kw in getattr(node, "keywords", []):
                 if kw.arg in ("target", "func", "callback") and isinstance(kw.value, (ast.Name, ast.Attribute)):
-                    kw_callee = self._resolve_callee(kw.value)
+                    kw_callee, is_h = self._resolve_callee(kw.value)
                     if kw_callee:
-                        self.graph.add_edge(self.current_function, kw_callee, kind="CALLS")
+                        edge_attrs = {"kind": "CALLS"}
+                        if is_h:
+                            edge_attrs["confidence"] = "heuristic"
+                        self.graph.add_edge(self.current_function, kw_callee, **edge_attrs)
+        self.generic_visit(node)
+
     def visit_Assign(self, node: ast.Assign):
         if isinstance(node.value, ast.Call):
             call_func = node.value.func
@@ -349,19 +373,19 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             )
             self.graph.add_edge(ep_id, self.module_node_id, kind="EXPOSES")
 
-    def _resolve_callee(self, func_node: ast.AST) -> Optional[str]:
+    def _resolve_callee(self, func_node: ast.AST) -> Tuple[Optional[str], bool]:
         if isinstance(func_node, ast.Name):
             name = func_node.id
             if name in self.imported_symbols:
                 mod, orig_name = self.imported_symbols[name]
                 if mod in self.module_to_file:
                     target_file = self.module_to_file[mod]
-                    return f"{target_file}::{orig_name}"
+                    return f"{target_file}::{orig_name}", False
                 else:
                     top_pkg = mod.split(".")[0].lower() if mod else name.lower()
-                    return f"pkg::{top_pkg}"
+                    return f"pkg::{top_pkg}", False
             elif name in self.local_functions:
-                return f"{self.file_path}::{name}"
+                return f"{self.file_path}::{name}", False
 
         elif isinstance(func_node, ast.Attribute):
             attr = func_node.attr
@@ -371,43 +395,27 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     mod = self.imported_modules[val_id]
                     if mod in self.module_to_file:
                         target_file = self.module_to_file[mod]
-                        return f"{target_file}::{attr}"
+                        return f"{target_file}::{attr}", False
                     else:
                         top_pkg = mod.split(".")[0].lower()
-                        return f"pkg::{top_pkg}"
+                        return f"pkg::{top_pkg}", False
                 elif val_id in ("self", "cls"):
                     if self.current_class:
-                        return f"{self.file_path}::{self.current_class}.{attr}"
-                    return f"{self.file_path}::{attr}"
+                        return f"{self.file_path}::{self.current_class}.{attr}", False
+                    return f"{self.file_path}::{attr}", False
                 else:
-                    # obj.method() - resolve methods matching attr on local classes or functions
+                    # obj.method() - resolve methods matching attr via tracked local instance types
                     cls_type = self.var_types.get(val_id)
                     if cls_type:
                         if cls_type in self.imported_symbols:
                             mod, orig_cls = self.imported_symbols[cls_type]
                             target_file = self.module_to_file.get(mod)
                             if target_file:
-                                return f"{target_file}::{orig_cls}.{attr}"
+                                return f"{target_file}::{orig_cls}.{attr}", True
                         elif cls_type in self.local_classes:
-                            return f"{self.file_path}::{cls_type}.{attr}"
+                            return f"{self.file_path}::{cls_type}.{attr}", True
 
-                    for fn in self.local_functions:
-                        if fn == attr or fn.endswith(f".{attr}"):
-                            return f"{self.file_path}::{fn}"
-                    if attr in self.imported_symbols:
-                        mod, orig_name = self.imported_symbols[attr]
-                        target_file = self.module_to_file.get(mod)
-                        if target_file:
-                            return f"{target_file}::{orig_name}"
-
-                    # Fallback: check if any imported class defines this method
-                    for sym, (mod, orig_cls) in self.imported_symbols.items():
-                        if sym and sym[0].isupper():
-                            target_file = self.module_to_file.get(mod)
-                            if target_file:
-                                return f"{target_file}::{orig_cls}.{attr}"
-
-        return None
+        return None, False
 
 
 class RiskGraph:
@@ -490,6 +498,7 @@ class RiskGraph:
         entrypoints = [n for n, d in self.graph.nodes(data=True) if d.get("kind") == "ENTRYPOINT"]
         exposure_rank = {
             "fastapi_or_flask": 4, "django_view": 4, "django": 4,
+            "startup": 3,
             "worker": 3, "celery": 3,
             "cli": 2, "cli_script": 2,
         }
@@ -529,6 +538,9 @@ class RiskGraph:
                     if fw in ("fastapi_or_flask", "django_view", "django"):
                         f.reachable = True
                         f.exposure = "HTTP"
+                    elif fw == "startup":
+                        f.reachable = True
+                        f.exposure = "STARTUP"
                     elif fw in ("worker", "celery"):
                         f.reachable = True
                         f.exposure = "WORKER"
@@ -564,15 +576,12 @@ class RiskGraph:
                 in_tree = f.extra.get("in_working_tree", True)
                 in_hist = f.extra.get("in_history", False)
                 is_test = is_test_path(norm_file) or f.extra.get("is_test_file", False)
+                f.extra["is_test_file"] = is_test
 
                 # Keep reachable = None to avoid overloading code call-graph reachability
                 f.reachable = None
 
-                if is_test:
-                    f.exposure = "TEST"
-                    f.blast_radius = 0
-                    f.extra["attack_path"] = []
-                elif in_tree:
+                if in_tree:
                     f.exposure = "REPO"
                     f.blast_radius = 1
                     loc = f"{norm_file}:{f.line}" if f.line else norm_file
@@ -631,6 +640,9 @@ class RiskGraph:
                 if fw in ("fastapi_or_flask", "django_view", "django"):
                     f.reachable = True
                     f.exposure = "HTTP"
+                elif fw == "startup":
+                    f.reachable = True
+                    f.exposure = "STARTUP"
                 elif fw in ("worker", "celery"):
                     f.reachable = True
                     f.exposure = "WORKER"
@@ -665,19 +677,25 @@ class RiskGraph:
     def _format_path(self, path: List[str]) -> List[str]:
         """Format node IDs into clean human-readable path strings with file and line references."""
         formatted = []
-        for node_id in path:
+        for i, node_id in enumerate(path):
             data = self.graph.nodes.get(node_id, {})
             label = data.get("label", node_id)
             kind = data.get("kind", "")
             file_name = data.get("file", "")
             line = data.get("line")
             loc = f" [{file_name}:{line}]" if file_name and line else ""
+            heuristic_tag = ""
+            if i > 0:
+                prev_id = path[i - 1]
+                edge_data = self.graph.get_edge_data(prev_id, node_id, default={})
+                if edge_data.get("confidence") == "heuristic":
+                    heuristic_tag = " (heuristic)"
             if kind == "ENTRYPOINT":
-                formatted.append(f"Entrypoint: {label}{loc}")
+                formatted.append(f"Entrypoint: {label}{loc}{heuristic_tag}")
             elif kind == "PACKAGE":
-                formatted.append(f"Package: {label}")
+                formatted.append(f"Package: {label}{heuristic_tag}")
             else:
-                formatted.append(f"{label}{loc}")
+                formatted.append(f"{label}{loc}{heuristic_tag}")
         return formatted
 
 

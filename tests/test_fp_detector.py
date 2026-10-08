@@ -176,11 +176,10 @@ def test_detect_seed_data_credentials_fixture(tmp_path):
     )
     detect_false_positives([f], repo_path=str(tmp_path))
     assert f.fp_likelihood == "HIGH"
-    assert f.extra.get("seed_classification") == "SEED"
+    assert f.extra.get("seed_classification") == "SEED_FULL"
     assert "Guarded seed fixture" in f.extra.get("guard_note", "")
     assert "seed_guards" not in f.extra
     assert "is_seed_fixture" not in f.extra
-    assert f.extra.get("damping_multiplier") == 0.20
     assert "seed credentials" in f.fp_reason.lower()
 
 
@@ -217,7 +216,7 @@ def test_carol_prod_and_bob_staging_never_damped(tmp_path):
 
 
 def test_demo_value_guard_rejects_8char_random(tmp_path):
-    """An 8-character random password must fail demo value guard despite low Shannon entropy."""
+    """An 8-character random password must fail demo value guard and NOT be damped despite sitting behind DEBUG."""
     code = """if os.getenv("DEBUG"):
     SEED_USERS = [
         {"username": "alice_dev", "password": "k8#mP9$x"},
@@ -236,13 +235,12 @@ def test_demo_value_guard_rejects_8char_random(tmp_path):
         evidence='{"username": "alice_dev", "password": "k8#mP9$x"}',
     )
     detect_false_positives([f], repo_path=str(tmp_path))
-    # Fails demo value guard because k8#mP9$x is not in demo wordlist or pattern
-    # Passes env, gate, cross (3/4 guards) -> at best MEDIUM mild damping, NOT HIGH
-    assert f.fp_likelihood == "MEDIUM"
-    assert f.extra.get("seed_classification") == "SEED"
-    assert "3/4 guards passed" in f.extra.get("guard_note", "")
+    # Fails demo value guard because k8#mP9$x is not in demo wordlist or pattern.
+    # Because g_demo is required for any damping, this credential is NOT damped.
+    assert f.fp_likelihood is None
+    assert f.extra.get("seed_classification") == "NOT_SEED"
     assert "demo=False" in f.extra.get("guard_note", "")
-    assert f.extra.get("damping_multiplier") == 0.60
+    assert f.extra.get("damping_multiplier") == 1.0
 
 
 def test_seed_value_in_config_fails_cross_file_guard(tmp_path):
@@ -319,3 +317,205 @@ def test_prng_otp_and_reset_code_retains_security_priority():
     assert f.extra.get("is_ref_id") is not True
     assert f.extra.get("is_security_token") is True
     assert "[REF-ID]" not in f.title
+
+
+def test_sql_fp_imported_request_rejected(tmp_path):
+    """Imported request object inside an f-string must evaluate as UNSAFE (fail-closed)."""
+    code = """from flask import request
+
+def get_data():
+    cur.execute(f"SELECT * FROM users WHERE id = {request.args['col']}")
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="semgrep",
+        title="SQL injection",
+        file="app.py",
+        line=4,
+        cwe="CWE-89",
+        severity=9.0,
+        evidence="cur.execute(f\"SELECT * FROM users WHERE id = {request.args['col']}\")",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
+
+
+def test_sql_fp_attribute_chain_rejected(tmp_path):
+    """Attribute chains like request.json.column or flask.request.args must NOT evaluate as safe."""
+    code = """def update_data():
+    cur.execute(f"UPDATE users SET col = {request.json.column}")
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="semgrep",
+        title="SQL injection",
+        file="app.py",
+        line=2,
+        cwe="CWE-89",
+        severity=9.0,
+        evidence="cur.execute(f\"UPDATE users SET col = {request.json.column}\")",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
+
+
+def test_sql_fp_string_concatenation_rejected(tmp_path):
+    """String concatenation with external user input must evaluate as UNSAFE."""
+    code = """def search_user(user_input):
+    cur.execute("SELECT * FROM users WHERE name = '" + user_input + "'")
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="bandit",
+        title="Bandit B608: Possible SQL injection vector through string-based query construction",
+        file="app.py",
+        line=2,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence="cur.execute(\"SELECT * FROM users WHERE name = '\" + user_input + \"'\")",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
+
+
+def test_sql_fp_format_kwarg_rejected(tmp_path):
+    """.format(col=user_input) keyword interpolation must evaluate as UNSAFE."""
+    code = """def query_user(user_input):
+    cur.execute("SELECT * FROM users WHERE name = '{col}'".format(col=user_input))
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="bandit",
+        title="Bandit B608: SQL injection",
+        file="app.py",
+        line=2,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence="cur.execute(\"SELECT * FROM users WHERE name = '{col}'\".format(col=user_input))",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
+
+
+def test_sql_fp_query_variable_built_elsewhere(tmp_path):
+    """cur.execute(query) where query was built earlier must trace the query definition."""
+    # Subtest A: unsafe query built earlier
+    code_unsafe = """def run_query(user_col):
+    query = "SELECT " + user_col + " FROM users"
+    cur.execute(query)
+"""
+    (tmp_path / "unsafe.py").write_text(code_unsafe, encoding="utf-8")
+    f_unsafe = Finding(
+        engine="semgrep",
+        title="SQL injection",
+        file="unsafe.py",
+        line=3,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence="cur.execute(query)",
+    )
+    detect_false_positives([f_unsafe], repo_path=str(tmp_path))
+    assert f_unsafe.fp_likelihood is None
+
+    # Subtest B: safe static DDL query built earlier
+    code_safe = """def run_migration():
+    query = "ALTER TABLE users ADD COLUMN age INT"
+    cur.execute(query)
+"""
+    (tmp_path / "safe.py").write_text(code_safe, encoding="utf-8")
+    f_safe = Finding(
+        engine="semgrep",
+        title="SQL injection",
+        file="safe.py",
+        line=3,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence="cur.execute(query)",
+    )
+    detect_false_positives([f_safe], repo_path=str(tmp_path))
+    assert f_safe.fp_likelihood == "HIGH"
+
+
+def test_sql_fp_picks_execute_over_adjacent_log_fstring(tmp_path):
+    """The detector must evaluate the SQL execute call, not an adjacent logging f-string."""
+    code = """import logging
+logger = logging.getLogger(__name__)
+
+def update_table(user_col):
+    logger.info(f"Updating table with {user_col}")
+    cur.execute(f"ALTER TABLE users ADD COLUMN {user_col} TEXT")
+"""
+    (tmp_path / "db.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="semgrep",
+        title="SQL injection",
+        file="db.py",
+        line=6,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence='cur.execute(f"ALTER TABLE users ADD COLUMN {user_col} TEXT")',
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
+
+
+def test_test_path_bandit_exec_not_mock_credential():
+    """Bandit findings in tests/ like exec/pickle/shell must NOT be tagged as Mock test credential."""
+    f = Finding(
+        engine="bandit",
+        title="Bandit B102: Use of exec detected",
+        file="tests/test_dynamic.py",
+        line=12,
+        cwe="CWE-78",
+        severity=7.5,
+        evidence="exec(code_str)",
+    )
+    detect_false_positives([f])
+    assert f.fp_likelihood is None
+
+
+def test_negative_polarity_gate_rejected(tmp_path):
+    """A negative gate condition (if env != 'dev') represents production and must NOT match as a dev gate."""
+    code = """def seed():
+    if env != "dev":
+        SEED_USERS = [
+            {"username": "alice_dev", "password": "alice123"},
+        ]
+"""
+    (tmp_path / "init_db.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="secrets",
+        title="Hard-coded password",
+        file="init_db.py",
+        line=4,
+        cwe="CWE-259",
+        severity=7.0,
+        evidence='{"username": "alice_dev", "password": "alice123"}',
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.extra.get("seed_classification") == "SEED_PARTIAL"
+    assert "gate=False" in f.extra.get("guard_note", "")
+    assert f.fp_likelihood == "MEDIUM"
+
+
+def test_seed_fixture_without_runtime_gate_gets_partial_damping(tmp_path):
+    """Seed credential meeting demo wordlist and env checks but missing runtime gate gets SEED_PARTIAL."""
+    code = """# Top-level seed definition in db initialization without runtime guard
+SEED_USERS = [
+    {"username": "alice_dev", "password": "alice123"},
+]
+"""
+    (tmp_path / "init_db.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="secrets",
+        title="Hard-coded password",
+        file="init_db.py",
+        line=3,
+        cwe="CWE-259",
+        severity=7.0,
+        evidence='{"username": "alice_dev", "password": "alice123"}',
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.extra.get("seed_classification") == "SEED_PARTIAL"
+    assert f.fp_likelihood == "MEDIUM"
+    assert "3/4 guards passed" in f.extra.get("guard_note", "")
