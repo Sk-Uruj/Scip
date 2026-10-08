@@ -4,11 +4,15 @@ import pytest
 from core.finding import Finding
 from scoring.risk_score import (
     DEFAULT_WEIGHTS,
+    DEFAULT_SCORING_CONFIG,
+    ScoringConfig,
     load_weights,
     calculate_finding_risk_score,
     score_and_sort_findings,
     _normalize_to_repo_rel,
 )
+from engines.secrets_engine import mask_secret
+import json
 from engines.churn_engine import get_git_churn
 
 
@@ -214,3 +218,56 @@ def test_score_and_sort_findings_descending():
     assert sorted_res[1].title == "Med"
     assert sorted_res[2].title == "Low"
     assert sorted_res[0].risk_score > sorted_res[1].risk_score > sorted_res[2].risk_score
+
+
+def test_scoring_config_bounds_validation():
+    """ScoringConfig validates that multipliers are strictly bounded in [0.05, 1.0]."""
+    # Valid config initializes fine
+    cfg = ScoringConfig(secret_repo_reach=0.85, secret_hist_reach=0.45)
+    assert cfg.secret_repo_reach == 0.85
+
+    # Out of bounds (> 1.0) must raise ValueError
+    with pytest.raises(ValueError, match="must be between 0.0 and 1.0"):
+        ScoringConfig(secret_repo_reach=1.5)
+
+    # Out of bounds (< 0.05) must raise ValueError
+    with pytest.raises(ValueError, match="must be between 0.05 and 1.0"):
+        ScoringConfig(fp_damping_factor=0.01)
+
+
+def test_serialized_report_contains_no_raw_secrets():
+    """Ensure raw secret values and unsalted hashes never leak into serialized JSON reports."""
+    import hashlib
+
+    raw_secret = "SuperSecretP@ssw0rd987!"
+    masked = mask_secret(raw_secret)
+    assert masked == "********"
+
+    raw_hash = hashlib.sha256(raw_secret.encode()).hexdigest()
+
+    # Create finding using structural location fingerprint instead of raw hash
+    f = Finding(
+        engine="secrets",
+        title="Hard-coded password",
+        file="services/auth.py",
+        line=42,
+        severity=7.5,
+        evidence=f'AUTH_SECRET = "{masked}"',
+        extra={
+            "masked_value": masked,
+            "fingerprint": hashlib.sha256(f"secrets:services/auth.py:42".encode()).hexdigest()[:16],
+            "exposure": "REPO",
+        },
+    )
+
+    calculate_finding_risk_score(f)
+
+    # Serialize whole report to JSON
+    report_json = json.dumps([f.to_dict()])
+
+    # Assert raw secret and raw hash are nowhere in the output
+    assert raw_secret not in report_json
+    assert raw_hash[:8] not in report_json
+    assert raw_hash not in report_json
+    assert "********" in report_json
+

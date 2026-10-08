@@ -495,7 +495,40 @@ class RiskGraph:
                 f.blast_radius = len(prod_callers)
                 continue
 
-            # Case B: Code finding (SAST, Secrets, Crypto)
+            # Case B: Secrets finding (Repository Exposure Model)
+            # Secrets are exposed via repository presence (tracked working tree or git history),
+            # NOT via code call-graph execution reachability.
+            elif f.engine == "secrets" or f.cwe in ("CWE-259", "CWE-798"):
+                in_tree = f.extra.get("in_working_tree", True)
+                in_hist = f.extra.get("in_history", False)
+                is_test = is_test_path(norm_file) or f.extra.get("is_test_file", False)
+
+                # Keep reachable = None to avoid overloading code call-graph reachability
+                f.reachable = None
+
+                if is_test:
+                    f.exposure = "TEST"
+                    f.blast_radius = 0
+                    f.extra["attack_path"] = []
+                elif in_tree:
+                    f.exposure = "REPO"
+                    f.blast_radius = 1
+                    loc = f"{norm_file}:{f.line}" if f.line else norm_file
+                    f.extra["attack_path"] = [f"Repository Working Tree: {loc}"]
+                elif in_hist:
+                    f.exposure = "HIST"
+                    f.blast_radius = 0
+                    first_commit = (f.extra.get("first_seen") or {}).get("commit", "git-history")
+                    f.extra["attack_path"] = [f"Git Commit History: commit {first_commit}"]
+                else:
+                    f.exposure = "NONE"
+                    f.blast_radius = 0
+                    f.extra["attack_path"] = []
+
+                f.extra["exposure"] = f.exposure
+                continue
+
+            # Case C: SAST & Crypto findings (AST & Call-Graph Reachability)
             full_path = os.path.join(str(self.repo_path), norm_file)
             target_func = find_enclosing_function(full_path, f.line)
             target_node = f"{norm_file}::{target_func}" if target_func else f"module::{norm_file}"

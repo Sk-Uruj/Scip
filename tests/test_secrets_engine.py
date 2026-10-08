@@ -63,10 +63,11 @@ def test_entropy_values():
 
 
 def test_masking_never_reveals_much():
-    assert mask_secret("abc") == "a**"
+    assert mask_secret("abc") == "********"
+    assert mask_secret("password123") == "********"
     key = fs.aws_access_key_id()               # built at runtime: no AWS-shaped literal in the source
     m = mask_secret(key)
-    assert m.startswith("AKIA****") and "20 chars" in m and key[-4:] not in m
+    assert m == "AKIA****" and key[-4:] not in m
 
 
 def test_fingerprint_is_stable_and_short():
@@ -453,7 +454,7 @@ def test_masking_replaces_only_the_secret_position_not_every_occurrence(tmp_path
     assert f == [] or "postgres://postgres:" in f[0].evidence      # 'postgres' password is a placeholder-ish default
     write(tmp_path, "b.py", 'U = "postgres://alice:Sup3rS3cretPw@db.prod.example.net/app"\n')
     g = [x for x in scan(tmp_path) if x.file == "b.py"][0]
-    assert "alice" in g.evidence and "Sup3rS3cretPw" not in g.evidence and "Sup3****" in g.evidence
+    assert "alice" in g.evidence and "Sup3rS3cretPw" not in g.evidence and "********" in g.evidence
 
 
 # ------------------------------------------------- recall regressions (found on vulpy / pygoat) --

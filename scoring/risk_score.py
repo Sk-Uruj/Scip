@@ -21,8 +21,7 @@ Weights are dynamically loaded from .env file or environment variables with defa
   WEIGHT_CHURN  = 0.05
   WEIGHT_HEALTH = 0.05
 """
-from __future__ import annotations
-
+from dataclasses import asdict, dataclass
 import logging
 import os
 from pathlib import Path
@@ -44,6 +43,28 @@ DEFAULT_WEIGHTS = {
     "WEIGHT_CHURN": 0.05,
     "WEIGHT_HEALTH": 0.05,
 }
+
+
+@dataclass
+class ScoringConfig:
+    """Configurable and bounded tuning knobs for composite risk scoring."""
+    fp_damping_factor: float = 0.20        # Uniform damping for ALL confirmed HIGH false positives (0.05 to 1.0)
+    secret_repo_reach: float = 0.80        # Exposure reach weight for secrets in working tree (0.0 to 1.0)
+    secret_hist_reach: float = 0.50        # Exposure reach weight for secrets in git history (0.0 to 1.0)
+    prng_ref_id_discount: float = 0.50     # Discount for reference/display IDs vs security tokens (0.1 to 1.0)
+
+    def __post_init__(self):
+        if not (0.05 <= self.fp_damping_factor <= 1.0):
+            raise ValueError(f"fp_damping_factor must be between 0.05 and 1.0, got {self.fp_damping_factor}")
+        if not (0.0 <= self.secret_repo_reach <= 1.0):
+            raise ValueError(f"secret_repo_reach must be between 0.0 and 1.0, got {self.secret_repo_reach}")
+        if not (0.0 <= self.secret_hist_reach <= 1.0):
+            raise ValueError(f"secret_hist_reach must be between 0.0 and 1.0, got {self.secret_hist_reach}")
+        if not (0.1 <= self.prng_ref_id_discount <= 1.0):
+            raise ValueError(f"prng_ref_id_discount must be between 0.1 and 1.0, got {self.prng_ref_id_discount}")
+
+
+DEFAULT_SCORING_CONFIG = ScoringConfig()
 
 
 def _normalize_to_repo_rel(file_path: str, repo_path: str) -> str:
@@ -107,10 +128,15 @@ def load_weights(repo_path: Optional[str] = None) -> Dict[str, float]:
     return weights
 
 
-def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]] = None) -> Finding:
+def calculate_finding_risk_score(
+    f: Finding,
+    weights: Optional[Dict[str, float]] = None,
+    config: Optional[ScoringConfig] = None,
+) -> Finding:
     """Calculate normalized 0-100 risk score and explanation string for a finding."""
     if weights is None:
         weights = load_weights()
+    config = config or DEFAULT_SCORING_CONFIG
 
     w_cvss = weights.get("WEIGHT_CVSS", 0.30)
     w_epss = weights.get("WEIGHT_EPSS", 0.20)
@@ -138,16 +164,18 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
     # 3. CISA KEV (1.0 if active, 0.0 otherwise)
     s_kev = 1.0 if bool(extra.get("kev")) else 0.0
 
-    # 4. Reachability & Exposure Tier
+    # 4. Reachability & Exposure Tier (Secrets use REPO / HIST exposure model)
     reach = getattr(f, "reachable", None)
     exposure = getattr(f, "exposure", None) or extra.get("exposure")
     if exposure == "HTTP":
         s_reach = 1.0
-    elif exposure == "WORKER":
-        s_reach = 0.5
+    elif exposure == "REPO":
+        s_reach = config.secret_repo_reach
+    elif exposure in ("WORKER", "HIST"):
+        s_reach = config.secret_hist_reach
     elif exposure == "CLI":
         s_reach = 0.3
-    elif exposure in ("TEST", "DEAD", "INTNL") or reach is False:
+    elif exposure in ("TEST", "DEAD", "INTNL", "NONE") or reach is False:
         s_reach = 0.0
     elif reach is True:
         s_reach = 1.0
@@ -185,33 +213,51 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
 
     risk_score = round(max(0.0, min(100.0, 100.0 * (weighted_sum / total_weight))), 2)
 
-    # 8. False Positive & Seed Fixture Damping
+    # 8. PRNG Context Adjustment (Reference ID vs Security Token)
+    ref_id_note = ""
+    if extra.get("is_ref_id"):
+        risk_score = round(risk_score * config.prng_ref_id_discount, 2)
+        ref_id_note = f", PRNG Ref-ID: {config.prng_ref_id_discount:.2f}x"
+
+    # 9. Rotation & Live Verification overrides
+    status_note = ""
+    if extra.get("rotated"):
+        risk_score = round(risk_score * 0.2, 2)
+        status_note = ", Rotated: 0.2x"
+    elif extra.get("live_verified"):
+        risk_score = round(min(100.0, risk_score * 1.5), 2)
+        status_note = ", Live Verified: 1.5x"
+
+    # 10. Graded Seed & Verified False Positive Damping
     fp_likely = getattr(f, "fp_likelihood", None) or extra.get("fp_likelihood")
-    is_seed = bool(extra.get("is_seed_fixture") or "seed" in (getattr(f, "fp_reason", "") or "").lower())
     fp_damped = False
     damping_factor = 1.0
     damping_label = "FP Damped"
 
-    if is_seed:
-        # Dev seed credentials in git history (CWE-1188): moderate damping (0.6x)
-        damping_factor = 0.6
-        damping_label = "Seed Damped"
-        risk_score = round(risk_score * damping_factor, 2)
-        fp_damped = True
+    if extra.get("damping_multiplier"):
+        damping_factor = float(extra["damping_multiplier"])
+        if damping_factor < 1.0:
+            risk_score = round(risk_score * damping_factor, 2)
+            fp_damped = True
+            damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
     elif fp_likely == "HIGH":
-        # Pure false positives (RFC compliance, DDL schema, safe-by-design): deep damping (0.15x)
-        damping_factor = 0.15
-        damping_label = "FP Damped"
+        damping_factor = config.fp_damping_factor
         risk_score = round(risk_score * damping_factor, 2)
         fp_damped = True
+        damping_label = "FP Damped"
+    elif fp_likely == "MEDIUM":
+        damping_factor = 0.60
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
 
     reach_label = exposure if exposure else ("YES" if reach is True else ("NO" if reach is False else "?"))
-    reach_info = f"Reach: {s_reach:.1f} (w={w_reach:.2f}, {reach_label}"
+    reach_info = f"Exposure: {reach_label} (s={s_reach:.2f}, w={w_reach:.2f}"
     if extra.get("attack_path"):
         reach_info += f", hops={len(extra['attack_path'])}"
     reach_info += ")"
 
-    fp_note = f", {damping_label}: {damping_factor}x ({getattr(f, 'fp_reason', '') or extra.get('fp_reason', '')})" if fp_damped else ""
+    fp_note = f", {damping_label}: {damping_factor:.2f}x ({getattr(f, 'fp_reason', '') or extra.get('fp_reason', '')})" if fp_damped else ""
     explanation = (
         f"Risk Score: {risk_score:.2f}/100 | "
         f"CVSS: {f.severity:.1f} (s={s_cvss:.2f}, w={w_cvss:.2f}), "
@@ -220,17 +266,25 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
         f"{reach_info}, "
         f"Blast: {s_blast:.2f} (w={w_blast:.2f}, count={blast_cnt}), "
         f"Churn: {s_churn:.2f} (w={w_churn:.2f}), "
-        f"Health: {s_health:.2f} (w={w_health:.2f}){fp_note}"
+        f"Health: {s_health:.2f} (w={w_health:.2f})"
+        f"{ref_id_note}{status_note}{fp_note}"
     )
 
     f.risk_score = risk_score
     f.explanation = explanation
+    f.extra["scoring_config"] = asdict(config)
     return f
 
 
-def score_and_sort_findings(findings: List[Finding], repo_path: Optional[str] = None) -> List[Finding]:
+def score_and_sort_findings(
+    findings: List[Finding],
+    repo_path: Optional[str] = None,
+    weights: Optional[Dict[str, float]] = None,
+    config: Optional[ScoringConfig] = None,
+) -> List[Finding]:
     """Score all findings and sort in descending order of risk_score (highest risk on top)."""
-    weights = load_weights(repo_path=repo_path)
+    weights = weights or load_weights(repo_path=repo_path)
+    config = config or DEFAULT_SCORING_CONFIG
 
     if repo_path:
         churn_counts = get_git_churn(repo_path)
@@ -269,6 +323,6 @@ def score_and_sort_findings(findings: List[Finding], repo_path: Optional[str] = 
             log.debug("FP detection error: %s", e)
 
     for f in findings:
-        calculate_finding_risk_score(f, weights=weights)
+        calculate_finding_risk_score(f, weights=weights, config=config)
 
     return sorted(findings, key=lambda f: (-f.risk_score, -f.severity, -f.exploitability))

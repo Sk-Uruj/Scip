@@ -153,7 +153,7 @@ def print_table(findings: List[Finding], engines: Optional[list] = None, show_ri
                 if len(loc) > 28:
                     loc = "..." + loc[-25:]
                 title = _ascii(f.title)
-                if f.extra.get("is_seed_fixture") or "seed" in (getattr(f, "fp_reason", "") or "").lower():
+                if f.extra.get("seed_classification") == "SEED" or "seed" in (getattr(f, "fp_reason", "") or "").lower():
                     title = f"[SEED] {title}"
                 elif getattr(f, "fp_likelihood", None) == "HIGH" or f.extra.get("fp_likelihood") == "HIGH":
                     title = f"[FP?] {title}"

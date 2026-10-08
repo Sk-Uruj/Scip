@@ -103,10 +103,24 @@ def shannon_entropy(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
 
 
+_KNOWN_PROVIDER_PREFIXES = (
+    "AKIA", "ASIA", "ABIA", "ACCA",
+    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "sk_live_", "pk_live_", "sk_test_", "pk_test_",
+    "xoxb-", "xoxp-", "xoxr-", "xoxa-",
+    "sq0atp-", "sq0csp-",
+    "AIza",
+)
+
+
 def mask_secret(s: str) -> str:
-    if len(s) <= 8:
-        return s[:1] + "*" * (len(s) - 1)
-    return f"{s[:4]}**** ({len(s)} chars)"
+    """Mask sensitive secret values without leaking initial characters or exact string length."""
+    if not s:
+        return "********"
+    for prefix in _KNOWN_PROVIDER_PREFIXES:
+        if s.startswith(prefix):
+            return f"{prefix}****"
+    return "********"
 
 
 def fingerprint(s: str) -> str:
@@ -355,6 +369,8 @@ def _mask_spans(text: str, spans: List[Tuple[int, int, str]]) -> str:
             continue
         out = out[:a] + mask + out[b:]
         last_start = a
+    # Normalize intra-line whitespace padding around values to prevent column alignment length leaks
+    out = re.sub(r"[ \t]{2,}", " ", out)
     return scrub_tokens(out)[:160]
 
 
@@ -709,6 +725,7 @@ class SecretsEngine(Engine):
                     "does not help; purging history (git filter-repo / BFG) is only a partial measure "
                     "once the repository has been cloned or pushed anywhere.")
 
+        loc_fp = hashlib.sha256(f"{m.rule_id}:{file}:{line}".encode("utf-8")).hexdigest()[:16]
         return Finding(
             engine=self.name,
             title=title,
@@ -724,7 +741,7 @@ class SecretsEngine(Engine):
                 "rule": m.rule_id,
                 "rule_title": m.title,
                 "confidence": m.confidence,
-                "fingerprint": m.fingerprint,
+                "fingerprint": loc_fp,
                 "variable": m.variable,
                 "masked_value": m.masked,
                 "entropy": round(m.entropy, 2),
