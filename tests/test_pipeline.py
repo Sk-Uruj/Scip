@@ -270,15 +270,24 @@ def test_pipeline_no_scoring_opt_out(tmp_path, monkeypatch):
 
 
 def test_pipeline_exclude_tests_and_details_cli(tmp_path, monkeypatch, capsys):
+    app_code = """from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/api")
+def api_route():
+    vulnerable()
+
+def vulnerable():
+    pass
+"""
+    (tmp_path / "app.py").write_text(app_code, encoding="utf-8")
+
     f_prod = Finding(
         engine="bandit",
         title="Prod Vulnerability",
         file="app.py",
-        line=10,
+        line=9,
         severity=7.5,
-        reachable=True,
-        exposure="HTTP",
-        extra={"attack_path": ["Entrypoint: GET /api [app.py:5]", "app.py:10"]},
         fix_hint="Validate input",
     )
     f_test = Finding(

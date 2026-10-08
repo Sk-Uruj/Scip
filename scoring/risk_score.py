@@ -141,15 +141,18 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
     # 4. Reachability & Exposure Tier
     reach = getattr(f, "reachable", None)
     exposure = getattr(f, "exposure", None) or extra.get("exposure")
-    if exposure == "HTTP" or reach is True:
+    if exposure == "HTTP":
         s_reach = 1.0
     elif exposure == "WORKER":
         s_reach = 0.5
     elif exposure == "CLI":
         s_reach = 0.3
-    elif exposure in ("TEST", "DEAD") or reach is False:
+    elif exposure in ("TEST", "DEAD", "INTNL") or reach is False:
         s_reach = 0.0
+    elif reach is True:
+        s_reach = 1.0
     else:
+        # reach is None / exposure UNKNOWN (analysis could not determine) -> neutral 0.5
         s_reach = 0.5
 
     # 5. Blast Radius (0.0 to 1.0, linear saturation capped at 10 callers)

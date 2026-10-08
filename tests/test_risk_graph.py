@@ -233,11 +233,42 @@ if __name__ == "__main__":
         rg.analyze_reachability([f_cli, f_worker])
 
         assert f_cli.exposure == "CLI"
+        assert f_cli.reachable is True
         assert len(f_cli.extra.get("attack_path", [])) >= 2
         # Verify path contains file and line info
         assert "migrate.py" in f_cli.extra["attack_path"][0]
 
         assert f_worker.exposure == "WORKER"
+        assert f_worker.reachable is True
         assert len(f_worker.extra.get("attack_path", [])) >= 2
         assert "tiering_engine.py" in f_worker.extra["attack_path"][0]
+
+
+def test_internal_only_and_unknown_reachability():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = """
+def internal_parent():
+    internal_child()
+
+def internal_child():
+    pass
+"""
+        with open(os.path.join(tmpdir, "helper.py"), "w") as f:
+            f.write(code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        # 1. Analyzed function with internal caller but no entrypoint -> reachable: False, exposure: INTNL
+        f_intnl = Finding(engine="bandit", title="Internal", file="helper.py", line=5)
+        # 2. Unknown function in non-existent file -> reachable: None, exposure: UNKNOWN
+        f_unknown = Finding(engine="bandit", title="Unknown", file="missing_file.py", line=10)
+
+        rg.analyze_reachability([f_intnl, f_unknown])
+
+        assert f_intnl.reachable is False
+        assert f_intnl.exposure == "INTNL"
+        assert f_intnl.blast_radius == 1
+
+        assert f_unknown.reachable is None
+        assert f_unknown.exposure == "UNKNOWN"
 

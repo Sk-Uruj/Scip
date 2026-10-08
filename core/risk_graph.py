@@ -447,7 +447,9 @@ class RiskGraph:
                 if not self.graph.has_node(pkg_node):
                     # Package is in requirements.txt but NEVER imported anywhere in application code
                     f.reachable = False
+                    f.exposure = "DEAD"
                     f.blast_radius = 0
+                    f.extra["exposure"] = f.exposure
                     f.extra["attack_path"] = []
                     continue
 
@@ -466,10 +468,10 @@ class RiskGraph:
                         f.reachable = True
                         f.exposure = "HTTP"
                     elif fw in ("worker", "celery"):
-                        f.reachable = None
+                        f.reachable = True
                         f.exposure = "WORKER"
                     elif fw in ("cli", "cli_script"):
-                        f.reachable = None
+                        f.reachable = True
                         f.exposure = "CLI"
                     else:
                         f.reachable = True
@@ -482,7 +484,7 @@ class RiskGraph:
                         f.reachable = False
                         f.exposure = "TEST"
                     else:
-                        f.reachable = None
+                        f.reachable = False
                         f.exposure = "INTNL"
                     f.extra["exposure"] = f.exposure
                     f.extra["attack_path"] = []
@@ -502,9 +504,11 @@ class RiskGraph:
                 target_node = f"module::{norm_file}"
 
             if not self.graph.has_node(target_node):
+                # Analysis could not determine target node in graph (unresolved AST / file)
                 f.reachable = None
-                f.exposure = "INTNL"
+                f.exposure = "UNKNOWN"
                 f.extra["exposure"] = f.exposure
+                f.extra["attack_path"] = []
                 continue
 
             # Calculate production blast radius (ancestors that are non-test functions)
@@ -531,10 +535,10 @@ class RiskGraph:
                     f.reachable = True
                     f.exposure = "HTTP"
                 elif fw in ("worker", "celery"):
-                    f.reachable = None
+                    f.reachable = True
                     f.exposure = "WORKER"
                 elif fw in ("cli", "cli_script"):
-                    f.reachable = None
+                    f.reachable = True
                     f.exposure = "CLI"
                 else:
                     f.reachable = True
@@ -552,7 +556,8 @@ class RiskGraph:
                     f.reachable = False
                     f.exposure = "DEAD"
                 else:
-                    f.reachable = None
+                    # Proven analyzed: internal callers exist, but zero entrypoint ingress paths
+                    f.reachable = False
                     f.exposure = "INTNL"
 
                 f.extra["exposure"] = f.exposure
