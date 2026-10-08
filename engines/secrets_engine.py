@@ -678,16 +678,25 @@ class SecretsEngine(Engine):
             truncated_diff_lines=truncated_lines,
         )
 
-    # ---- main entry ------------------------------------------------------ #
     def scan(self, repo_path: str) -> List[Finding]:
         root = Path(repo_path).resolve()
+        self._current_root = root
         self.stats = {"history_scanned": False}
         aggs: Dict[str, _Agg] = {}
         self._scan_tree(root, aggs)
         if self.scan_history:
             self._scan_history(root, aggs)
 
-        findings = [self._make_finding(a) for a in aggs.values()]
+        loc_counts: Dict[Tuple[str, str, int], int] = {}
+        findings: List[Finding] = []
+        for a in aggs.values():
+            m = a.match
+            f_path, f_line = a.tree[0] if a.tree else (a.history[0]["file"], a.history[0]["line"])
+            loc_key = (m.rule_id, f_path, f_line)
+            occ_idx = loc_counts.get(loc_key, 0)
+            loc_counts[loc_key] = occ_idx + 1
+            findings.append(self._make_finding(a, occ_idx=occ_idx))
+
         findings.sort(key=lambda f: (-f.severity, -f.exploitability, f.file, f.line or 0))
         self.stats.update(
             secrets_found=len(findings),
@@ -696,7 +705,7 @@ class SecretsEngine(Engine):
         )
         return findings
 
-    def _make_finding(self, a: _Agg) -> Finding:
+    def _make_finding(self, a: _Agg, occ_idx: int = 0) -> Finding:
         m = a.match
         in_tree, in_hist = bool(a.tree), bool(a.history)
         first = a.history[0] if in_hist else None
@@ -725,7 +734,21 @@ class SecretsEngine(Engine):
                     "does not help; purging history (git filter-repo / BFG) is only a partial measure "
                     "once the repository has been cloned or pushed anywhere.")
 
-        loc_fp = hashlib.sha256(f"{m.rule_id}:{file}:{line}".encode("utf-8")).hexdigest()[:16]
+        scope = "global"
+        full_path = (self._current_root / file) if hasattr(self, "_current_root") and self._current_root else None
+        if full_path and full_path.is_file() and line:
+            try:
+                from engines.blast_radius_engine import find_enclosing_function
+                enc = find_enclosing_function(str(full_path), line)
+                if enc:
+                    scope = enc
+            except Exception:
+                pass
+        if scope == "global" and m.variable:
+            scope = m.variable
+
+        col = getattr(m, "col_offset", 0) or 0
+        loc_fp = hashlib.sha256(f"{m.rule_id}:{file}:{scope}:{line}:{col}:{occ_idx}".encode("utf-8")).hexdigest()[:16]
         return Finding(
             engine=self.name,
             title=title,
@@ -744,7 +767,6 @@ class SecretsEngine(Engine):
                 "fingerprint": loc_fp,
                 "variable": m.variable,
                 "masked_value": m.masked,
-                "entropy": round(m.entropy, 2),
                 "in_working_tree": in_tree,
                 "in_history": in_hist,
                 "first_seen": first,

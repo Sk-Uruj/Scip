@@ -79,6 +79,8 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
         self.current_function: Optional[str] = None
 
         self.local_functions: Set[str] = set()
+        self.local_classes: Set[str] = set()
+        self.var_types: Dict[str, str] = {}
         self.imported_symbols: Dict[str, Tuple[str, str]] = {}  # symbol -> (module_or_pkg, orig_name)
         self.imported_modules: Dict[str, str] = {}              # alias -> module_or_pkg
 
@@ -87,6 +89,8 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.local_functions.add(node.name)
+            elif isinstance(node, ast.ClassDef):
+                self.local_classes.add(node.name)
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     pkg_or_mod = alias.name
@@ -206,7 +210,7 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 dec_str = dec.id
 
             dec_lower = dec_str.lower()
-            if any(k in dec_lower for k in ("app.get", "app.post", "app.put", "app.delete", "app.route", "router.", "bp.route")):
+            if any(k in dec_lower for k in ("app.get", "app.post", "app.put", "app.delete", "app.route", "router.", "bp.route", "on_event", "lifespan")):
                 entrypoint_type = "fastapi_or_flask"
                 break
             elif "click.command" in dec_lower or "app.command" in dec_lower:
@@ -245,11 +249,41 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             )
             self.graph.add_edge(ep_id, func_id, kind="EXPOSES")
 
+        # Connect FastAPI Depends(...) in argument defaults
+        args_node = getattr(node, "args", None)
+        if args_node:
+            all_defaults = [d for d in getattr(args_node, "defaults", []) if d] + [d for d in getattr(args_node, "kw_defaults", []) if d]
+            for d in all_defaults:
+                if isinstance(d, ast.Call):
+                    func_id_name = getattr(d.func, "id", "") or getattr(d.func, "attr", "")
+                    if func_id_name == "Depends" and d.args:
+                        dep_target = self._resolve_callee(d.args[0])
+                        if dep_target:
+                            self.graph.add_edge(func_id, dep_target, kind="CALLS")
+
     def visit_Call(self, node: ast.Call):
         if self.current_function:
             callee_id = self._resolve_callee(node.func)
             if callee_id:
                 self.graph.add_edge(self.current_function, callee_id, kind="CALLS")
+            # Resolve Thread(target=...), add_job(func=...), etc.
+            for kw in getattr(node, "keywords", []):
+                if kw.arg in ("target", "func", "callback") and isinstance(kw.value, (ast.Name, ast.Attribute)):
+                    kw_callee = self._resolve_callee(kw.value)
+                    if kw_callee:
+                        self.graph.add_edge(self.current_function, kw_callee, kind="CALLS")
+    def visit_Assign(self, node: ast.Assign):
+        if isinstance(node.value, ast.Call):
+            call_func = node.value.func
+            type_name = None
+            if isinstance(call_func, ast.Name):
+                type_name = call_func.id
+            elif isinstance(call_func, ast.Attribute):
+                type_name = call_func.attr
+            if type_name:
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        self.var_types[t.id] = type_name
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If):
@@ -345,6 +379,33 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     if self.current_class:
                         return f"{self.file_path}::{self.current_class}.{attr}"
                     return f"{self.file_path}::{attr}"
+                else:
+                    # obj.method() - resolve methods matching attr on local classes or functions
+                    cls_type = self.var_types.get(val_id)
+                    if cls_type:
+                        if cls_type in self.imported_symbols:
+                            mod, orig_cls = self.imported_symbols[cls_type]
+                            target_file = self.module_to_file.get(mod)
+                            if target_file:
+                                return f"{target_file}::{orig_cls}.{attr}"
+                        elif cls_type in self.local_classes:
+                            return f"{self.file_path}::{cls_type}.{attr}"
+
+                    for fn in self.local_functions:
+                        if fn == attr or fn.endswith(f".{attr}"):
+                            return f"{self.file_path}::{fn}"
+                    if attr in self.imported_symbols:
+                        mod, orig_name = self.imported_symbols[attr]
+                        target_file = self.module_to_file.get(mod)
+                        if target_file:
+                            return f"{target_file}::{orig_name}"
+
+                    # Fallback: check if any imported class defines this method
+                    for sym, (mod, orig_cls) in self.imported_symbols.items():
+                        if sym and sym[0].isupper():
+                            target_file = self.module_to_file.get(mod)
+                            if target_file:
+                                return f"{target_file}::{orig_cls}.{attr}"
 
         return None
 
@@ -437,7 +498,7 @@ class RiskGraph:
             if not f.file:
                 continue
 
-            norm_file = f.file.replace("\\", "/").lstrip("./")
+            norm_file = f.file.replace("\\", "/").removeprefix("./")
 
             # Case A: Dependency finding
             if f.engine == "dependency":
@@ -453,10 +514,11 @@ class RiskGraph:
                     f.extra["attack_path"] = []
                     continue
 
-                # Check if any entrypoint can reach pkg_node
+                # Check if any entrypoint can reach pkg_node using O(1) ancestor check
+                ancestors = nx.ancestors(self.graph, pkg_node)
                 reachable_paths = []
                 for ep in entrypoints:
-                    if nx.has_path(self.graph, ep, pkg_node):
+                    if ep in ancestors:
                         path = nx.shortest_path(self.graph, ep, pkg_node)
                         reachable_paths.append((ep, path))
 
@@ -514,12 +576,14 @@ class RiskGraph:
                     f.exposure = "REPO"
                     f.blast_radius = 1
                     loc = f"{norm_file}:{f.line}" if f.line else norm_file
-                    f.extra["attack_path"] = [f"Repository Working Tree: {loc}"]
+                    f.extra["exposure_detail"] = f"Repository Working Tree: {loc}"
+                    f.extra["attack_path"] = []
                 elif in_hist:
                     f.exposure = "HIST"
                     f.blast_radius = 0
                     first_commit = (f.extra.get("first_seen") or {}).get("commit", "git-history")
-                    f.extra["attack_path"] = [f"Git Commit History: commit {first_commit}"]
+                    f.extra["exposure_detail"] = f"Git Commit History: commit {first_commit}"
+                    f.extra["attack_path"] = []
                 else:
                     f.exposure = "NONE"
                     f.blast_radius = 0
@@ -553,10 +617,10 @@ class RiskGraph:
             }
             f.blast_radius = len(prod_callers)
 
-            # Check if reachable from ANY entrypoint
+            # Check if reachable from ANY entrypoint using O(1) ancestors check
             reachable_paths = []
             for ep in entrypoints:
-                if nx.has_path(self.graph, ep, target_node):
+                if ep in ancestors:
                     path = nx.shortest_path(self.graph, ep, target_node)
                     reachable_paths.append((ep, path))
 

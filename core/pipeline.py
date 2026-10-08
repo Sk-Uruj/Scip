@@ -195,7 +195,7 @@ def print_table(findings: List[Finding], engines: Optional[list] = None, show_ri
 
 def print_attack_paths(findings: List[Finding]) -> None:
     """Print detailed visual attack paths and remediation hints for reachable findings."""
-    reachable = [f for f in findings if f.extra.get("attack_path")]
+    reachable = [f for f in findings if f.extra.get("attack_path") and f.exposure not in ("REPO", "HIST")]
     if not reachable:
         return
 

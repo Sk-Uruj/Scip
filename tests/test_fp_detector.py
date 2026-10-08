@@ -19,39 +19,72 @@ def test_detect_s3_etag_false_positive():
     assert f.fp_likelihood == "HIGH"
     assert "S3 ETag" in f.fp_reason
 
-    # Risk score must be damped by 0.4x
+    # Risk score must be damped by 0.2x
     calculate_finding_risk_score(f)
     assert "FP Damped" in f.explanation
 
 
-def test_detect_ddl_migration_sql_false_positive():
+def test_detect_ddl_migration_sql_false_positive(tmp_path):
+    code = """def migrate():
+    MIGRATIONS = [("status", "TEXT"), ("retries", "INTEGER")]
+    for col_name, col_def in MIGRATIONS:
+        cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_def}")
+"""
+    (tmp_path / "init_db.py").write_text(code, encoding="utf-8")
     f = Finding(
         engine="semgrep",
         title="SQL query with formatted string",
         file="init_db.py",
-        line=202,
+        line=4,
         cwe="CWE-89",
         severity=8.5,
         evidence='cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} {col_def}")',
     )
-    detect_false_positives([f])
+    detect_false_positives([f], repo_path=str(tmp_path))
     assert f.fp_likelihood == "HIGH"
     assert "DDL schema migration" in f.fp_reason
 
 
-def test_detect_whitelisted_sql_identifier_false_positive():
+def test_detect_whitelisted_sql_identifier_false_positive(tmp_path):
+    code = """DEMOTION_CHAIN = [("HOT", "COOL", 120)]
+def manage_tiers():
+    for from_tier, to_tier, _ in DEMOTION_CHAIN:
+        entered_col = f"{to_tier.lower()}_entered_at"
+        conn.execute(f"UPDATE files SET {entered_col} = ?", (to_tier,))
+"""
+    (tmp_path / "tiering_engine.py").write_text(code, encoding="utf-8")
     f = Finding(
         engine="semgrep",
         title="SQL query with formatted string",
         file="tiering_engine.py",
-        line=179,
+        line=5,
         cwe="CWE-89",
         severity=8.5,
         evidence="UPDATE files SET {entered_col} = ?",
     )
-    detect_false_positives([f])
+    detect_false_positives([f], repo_path=str(tmp_path))
     assert f.fp_likelihood == "HIGH"
     assert "whitelisted" in f.fp_reason
+
+
+def test_sql_fp_adversarial_request_field(tmp_path):
+    """Adversarial check: dynamic SQL using request parameters must NEVER be flagged as FP."""
+    code = """def update_record(request):
+    col_name = request.json.get("column_name")
+    cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} TEXT")
+"""
+    (tmp_path / "api.py").write_text(code, encoding="utf-8")
+    f = Finding(
+        engine="semgrep",
+        title="SQL query with formatted string",
+        file="api.py",
+        line=3,
+        cwe="CWE-89",
+        severity=8.5,
+        evidence='cur.execute(f"ALTER TABLE files ADD COLUMN {col_name} TEXT")',
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood is None
 
 
 def test_detect_test_fixture_secret_false_positive():
@@ -67,6 +100,22 @@ def test_detect_test_fixture_secret_false_positive():
     detect_false_positives([f])
     assert f.fp_likelihood == "HIGH"
     assert "Mock test credential" in f.fp_reason
+
+
+def test_test_path_live_provider_key_exempt():
+    """Live provider-format keys in test paths must NOT be blanket-damped as FP."""
+    f = Finding(
+        engine="secrets",
+        title="AWS Access Key ID",
+        file="tests/conftest.py",
+        line=10,
+        cwe="CWE-798",
+        severity=8.5,
+        evidence='AWS_KEY = "AKIAIOSFODNN7EXAMPLE"',
+        extra={"is_provider_token": True, "provider_prefix": "AKIA"},
+    )
+    detect_false_positives([f])
+    assert f.fp_likelihood is None
 
 
 def test_true_positive_not_flagged_as_fp():
@@ -197,14 +246,14 @@ def test_demo_value_guard_rejects_8char_random(tmp_path):
 
 
 def test_seed_value_in_config_fails_cross_file_guard(tmp_path):
-    """If a seed secret variable appears in config.py or .env, cross-file guard fails."""
+    """If a seed secret value appears in config.py or .env, cross-file guard fails and it is NOT damped."""
     init_code = """if os.getenv("DEBUG"):
     ADMIN_DEV_TOKEN = "testpass123"
 """
     (tmp_path / "init_db.py").write_text(init_code, encoding="utf-8")
 
     config_code = """# Production configuration
-AUTH_SECRET = ADMIN_DEV_TOKEN
+AUTH_SECRET = "testpass123"
 """
     (tmp_path / "config.py").write_text(config_code, encoding="utf-8")
 
@@ -219,12 +268,12 @@ AUTH_SECRET = ADMIN_DEV_TOKEN
         extra={"variable": "ADMIN_DEV_TOKEN"},
     )
     detect_false_positives([f], repo_path=str(tmp_path))
-    # ADMIN_DEV_TOKEN is used in config.py, cross-file guard fails (3/4 passed) -> mild damping
-    assert f.fp_likelihood == "MEDIUM"
-    assert f.extra.get("seed_classification") == "SEED"
-    assert "3/4 guards passed" in f.extra.get("guard_note", "")
+    # Secret value is leaked into config.py, cross-file guard fails.
+    # Because env and cross are strictly mandatory, it fails and is NOT damped.
+    assert f.fp_likelihood is None
+    assert f.extra.get("seed_classification") == "NOT_SEED"
     assert "cross=False" in f.extra.get("guard_note", "")
-    assert f.extra.get("damping_multiplier") == 0.60
+    assert f.extra.get("damping_multiplier") == 1.0
 
 
 def test_prng_context_token_vs_ref_id():
@@ -255,3 +304,18 @@ def test_prng_context_token_vs_ref_id():
     assert "[REF-ID]" in f_ref.title
 
 
+def test_prng_otp_and_reset_code_retains_security_priority():
+    """reset_code, verification_code, and otp must retain security classification and never be tagged [REF-ID]."""
+    f = Finding(
+        engine="bandit",
+        title="Bandit B311: Standard pseudo-random generators not suitable for security",
+        file="auth.py",
+        line=85,
+        cwe="CWE-330",
+        severity=6.5,
+        evidence="reset_code = ''.join(random.choices(string.digits, k=6))",
+    )
+    detect_false_positives([f])
+    assert f.extra.get("is_ref_id") is not True
+    assert f.extra.get("is_security_token") is True
+    assert "[REF-ID]" not in f.title

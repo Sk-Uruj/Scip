@@ -272,3 +272,46 @@ def internal_child():
         assert f_unknown.reachable is None
         assert f_unknown.exposure == "UNKNOWN"
 
+
+def test_route_calling_class_method():
+    """Verify route calling a class method resolves Class.method reachability and returns reachable=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        main_code = """
+from fastapi import FastAPI
+from service import AuthService
+
+app = FastAPI()
+
+@app.post("/login")
+def login_route():
+    svc = AuthService()
+    svc.authenticate()
+"""
+        service_code = """
+class AuthService:
+    def authenticate(self):
+        # Line 4: inside AuthService.authenticate
+        pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(main_code)
+        with open(os.path.join(tmpdir, "service.py"), "w") as f:
+            f.write(service_code)
+
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+
+        f_method = Finding(
+            engine="bandit",
+            title="WeakAuth",
+            file="service.py",
+            line=4,
+            severity=7.5,
+        )
+        rg.analyze_reachability([f_method])
+
+        assert f_method.reachable is True
+        assert f_method.exposure == "HTTP"
+        assert len(f_method.extra.get("attack_path", [])) >= 2
+        assert "AuthService.authenticate" in f_method.extra["attack_path"][-1]
+
+

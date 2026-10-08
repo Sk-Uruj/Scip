@@ -21,6 +21,8 @@ Weights are dynamically loaded from .env file or environment variables with defa
   WEIGHT_CHURN  = 0.05
   WEIGHT_HEALTH = 0.05
 """
+from __future__ import annotations
+
 from dataclasses import asdict, dataclass
 import logging
 import os
@@ -49,19 +51,40 @@ DEFAULT_WEIGHTS = {
 class ScoringConfig:
     """Configurable and bounded tuning knobs for composite risk scoring."""
     fp_damping_factor: float = 0.20        # Uniform damping for ALL confirmed HIGH false positives (0.05 to 1.0)
+    fp_med_damping: float = 0.60           # Damping for MEDIUM false positives (0.05 to 1.0)
     secret_repo_reach: float = 0.80        # Exposure reach weight for secrets in working tree (0.0 to 1.0)
     secret_hist_reach: float = 0.50        # Exposure reach weight for secrets in git history (0.0 to 1.0)
+    worker_reach: float = 0.70             # Exposure reach weight for background worker tasks (0.0 to 1.0)
+    cli_reach: float = 0.30                # Exposure reach weight for CLI tools (0.0 to 1.0)
+    internal_reach: float = 0.20           # Exposure reach weight for internal production code (0.0 to 1.0)
+    unknown_reach: float = 0.50            # Exposure reach weight when reachability is indeterminate (0.0 to 1.0)
     prng_ref_id_discount: float = 0.50     # Discount for reference/display IDs vs security tokens (0.1 to 1.0)
+    rotated_factor: float = 0.20           # Multiplier for confirmed rotated credentials (0.05 to 1.0)
+    live_verified_factor: float = 1.50     # Multiplier for confirmed live credentials (1.0 to 3.0)
 
     def __post_init__(self):
         if not (0.05 <= self.fp_damping_factor <= 1.0):
             raise ValueError(f"fp_damping_factor must be between 0.05 and 1.0, got {self.fp_damping_factor}")
+        if not (0.05 <= self.fp_med_damping <= 1.0):
+            raise ValueError(f"fp_med_damping must be between 0.05 and 1.0, got {self.fp_med_damping}")
         if not (0.0 <= self.secret_repo_reach <= 1.0):
             raise ValueError(f"secret_repo_reach must be between 0.0 and 1.0, got {self.secret_repo_reach}")
         if not (0.0 <= self.secret_hist_reach <= 1.0):
             raise ValueError(f"secret_hist_reach must be between 0.0 and 1.0, got {self.secret_hist_reach}")
+        if not (0.0 <= self.worker_reach <= 1.0):
+            raise ValueError(f"worker_reach must be between 0.0 and 1.0, got {self.worker_reach}")
+        if not (0.0 <= self.cli_reach <= 1.0):
+            raise ValueError(f"cli_reach must be between 0.0 and 1.0, got {self.cli_reach}")
+        if not (0.0 <= self.internal_reach <= 1.0):
+            raise ValueError(f"internal_reach must be between 0.0 and 1.0, got {self.internal_reach}")
+        if not (0.0 <= self.unknown_reach <= 1.0):
+            raise ValueError(f"unknown_reach must be between 0.0 and 1.0, got {self.unknown_reach}")
         if not (0.1 <= self.prng_ref_id_discount <= 1.0):
             raise ValueError(f"prng_ref_id_discount must be between 0.1 and 1.0, got {self.prng_ref_id_discount}")
+        if not (0.05 <= self.rotated_factor <= 1.0):
+            raise ValueError(f"rotated_factor must be between 0.05 and 1.0, got {self.rotated_factor}")
+        if not (1.0 <= self.live_verified_factor <= 3.0):
+            raise ValueError(f"live_verified_factor must be between 1.0 and 3.0, got {self.live_verified_factor}")
 
 
 DEFAULT_SCORING_CONFIG = ScoringConfig()
@@ -171,17 +194,24 @@ def calculate_finding_risk_score(
         s_reach = 1.0
     elif exposure == "REPO":
         s_reach = config.secret_repo_reach
-    elif exposure in ("WORKER", "HIST"):
+    elif exposure == "HIST":
         s_reach = config.secret_hist_reach
+    elif exposure == "WORKER":
+        s_reach = config.worker_reach
     elif exposure == "CLI":
-        s_reach = 0.3
-    elif exposure in ("TEST", "DEAD", "INTNL", "NONE") or reach is False:
+        s_reach = config.cli_reach
+    elif exposure == "INTNL":
+        s_reach = config.internal_reach
+    elif exposure in ("TEST", "DEAD", "NONE"):
         s_reach = 0.0
+    elif exposure == "UNKNOWN" or reach is None:
+        s_reach = config.unknown_reach
     elif reach is True:
         s_reach = 1.0
+    elif reach is False:
+        s_reach = config.internal_reach if exposure == "INTNL" else 0.0
     else:
-        # reach is None / exposure UNKNOWN (analysis could not determine) -> neutral 0.5
-        s_reach = 0.5
+        s_reach = config.unknown_reach
 
     # 5. Blast Radius (0.0 to 1.0, linear saturation capped at 10 callers)
     blast_cnt = int(getattr(f, "blast_radius", 0) or 0)
@@ -222,11 +252,11 @@ def calculate_finding_risk_score(
     # 9. Rotation & Live Verification overrides
     status_note = ""
     if extra.get("rotated"):
-        risk_score = round(risk_score * 0.2, 2)
-        status_note = ", Rotated: 0.2x"
+        risk_score = round(risk_score * config.rotated_factor, 2)
+        status_note = f", Rotated: {config.rotated_factor:.2f}x"
     elif extra.get("live_verified"):
-        risk_score = round(min(100.0, risk_score * 1.5), 2)
-        status_note = ", Live Verified: 1.5x"
+        risk_score = round(min(100.0, risk_score * config.live_verified_factor), 2)
+        status_note = f", Live Verified: {config.live_verified_factor:.2f}x"
 
     # 10. Graded Seed & Verified False Positive Damping
     fp_likely = getattr(f, "fp_likelihood", None) or extra.get("fp_likelihood")
@@ -234,19 +264,19 @@ def calculate_finding_risk_score(
     damping_factor = 1.0
     damping_label = "FP Damped"
 
-    if extra.get("damping_multiplier"):
-        damping_factor = float(extra["damping_multiplier"])
-        if damping_factor < 1.0:
-            risk_score = round(risk_score * damping_factor, 2)
-            fp_damped = True
-            damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
+    d_mult = extra.get("damping_multiplier")
+    if d_mult is not None and float(d_mult) < 1.0:
+        damping_factor = float(d_mult)
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"
     elif fp_likely == "HIGH":
         damping_factor = config.fp_damping_factor
         risk_score = round(risk_score * damping_factor, 2)
         fp_damped = True
         damping_label = "FP Damped"
     elif fp_likely == "MEDIUM":
-        damping_factor = 0.60
+        damping_factor = config.fp_med_damping
         risk_score = round(risk_score * damping_factor, 2)
         fp_damped = True
         damping_label = "Seed Damped" if extra.get("seed_classification") == "SEED" else "FP Damped"

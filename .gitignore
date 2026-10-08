@@ -25,3 +25,9 @@ test_repos/*
 !.vscode/settings.json
 .DS_Store
 Thumbs.db
+
+# --- Generated scan reports & findings ---
+*findings*.json
+*report*.txt
+*.sqlite3
+*.db

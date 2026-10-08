@@ -122,8 +122,38 @@ class ASTCallGraphVisitor(ast.NodeVisitor):
         return None
 
 
+class _EnclosingFuncVisitor(ast.NodeVisitor):
+    def __init__(self, line_no: int):
+        self.line_no = line_no
+        self.current_class: Optional[str] = None
+        self.enclosing: Optional[str] = None
+        self.smallest_span: float = float("inf")
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        prev = self.current_class
+        self.current_class = f"{prev}.{node.name}" if prev else node.name
+        self.generic_visit(node)
+        self.current_class = prev
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._check(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self._check(node)
+
+    def _check(self, node: ast.AST):
+        start = node.lineno
+        end = getattr(node, "end_lineno", node.lineno)
+        if start <= self.line_no <= end:
+            span = end - start
+            if span < self.smallest_span:
+                self.smallest_span = span
+                self.enclosing = f"{self.current_class}.{node.name}" if self.current_class else node.name
+        self.generic_visit(node)
+
+
 def find_enclosing_function(file_full_path: str, line_number: Optional[int]) -> Optional[str]:
-    """Find the function name enclosing a given line number using AST parsing."""
+    """Find the function (or Class.method) name enclosing a given line number using AST parsing."""
     if not line_number or not os.path.exists(file_full_path):
         return None
 
@@ -134,20 +164,9 @@ def find_enclosing_function(file_full_path: str, line_number: Optional[int]) -> 
     except Exception:
         return None
 
-    enclosing_func = None
-    smallest_span = float("inf")
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            start_line = node.lineno
-            end_line = getattr(node, "end_lineno", node.lineno)
-            if start_line <= line_number <= end_line:
-                span = end_line - start_line
-                if span < smallest_span:
-                    smallest_span = span
-                    enclosing_func = node.name
-
-    return enclosing_func
+    visitor = _EnclosingFuncVisitor(line_number)
+    visitor.visit(tree)
+    return visitor.enclosing
 
 
 def calculate_blast_radius(findings: List[Finding], repo_path: str) -> Dict[str, int]:
@@ -214,7 +233,7 @@ def calculate_blast_radius(findings: List[Finding], repo_path: str) -> Dict[str,
         if not f.file:
             continue
 
-        norm_file = f.file.replace("\\", "/").lstrip("./")
+        norm_file = f.file.replace("\\", "/").removeprefix("./")
         full_file_path = os.path.join(str(repo), norm_file)
 
         target_func = find_enclosing_function(full_file_path, f.line)

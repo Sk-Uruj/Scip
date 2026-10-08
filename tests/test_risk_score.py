@@ -235,39 +235,42 @@ def test_scoring_config_bounds_validation():
         ScoringConfig(fp_damping_factor=0.01)
 
 
-def test_serialized_report_contains_no_raw_secrets():
-    """Ensure raw secret values and unsalted hashes never leak into serialized JSON reports."""
+def test_serialized_report_contains_no_raw_secrets(tmp_path):
+    """Ensure raw secret values, unsalted hashes, and length hints never leak from real engine scan."""
+    from engines.secrets_engine import SecretsEngine
     import hashlib
 
-    raw_secret = "SuperSecretP@ssw0rd987!"
-    masked = mask_secret(raw_secret)
-    assert masked == "********"
+    raw_secret = "ghp_VerySuperSecretToken123456789XYZ"
+    code = f"""def get_client():
+    token = "{raw_secret}"
+    return token
+"""
+    (tmp_path / "auth.py").write_text(code, encoding="utf-8")
 
-    raw_hash = hashlib.sha256(raw_secret.encode()).hexdigest()
+    engine = SecretsEngine(scan_history=False)
+    findings = engine.scan(str(tmp_path))
+    assert len(findings) >= 1
 
-    # Create finding using structural location fingerprint instead of raw hash
-    f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="services/auth.py",
-        line=42,
-        severity=7.5,
-        evidence=f'AUTH_SECRET = "{masked}"',
-        extra={
-            "masked_value": masked,
-            "fingerprint": hashlib.sha256(f"secrets:services/auth.py:42".encode()).hexdigest()[:16],
-            "exposure": "REPO",
-        },
-    )
+    for f in findings:
+        calculate_finding_risk_score(f)
 
-    calculate_finding_risk_score(f)
+    report_json = json.dumps([f.to_dict() for f in findings])
 
-    # Serialize whole report to JSON
-    report_json = json.dumps([f.to_dict()])
-
-    # Assert raw secret and raw hash are nowhere in the output
+    # Raw secret must never appear in report
     assert raw_secret not in report_json
-    assert raw_hash[:8] not in report_json
+
+    # Unsalted hash of raw secret must never appear
+    raw_hash = hashlib.sha256(raw_secret.encode()).hexdigest()
     assert raw_hash not in report_json
-    assert "********" in report_json
+    assert raw_hash[:8] not in report_json
+
+    # No exact length hint or entropy leaking length
+    assert f"length: {len(raw_secret)}" not in report_json
+    assert '"entropy"' not in report_json
+
+    # Masked value format
+    for f in findings:
+        mv = f.extra.get("masked_value", "")
+        assert mv.startswith("ghp_") or mv == "********"
+        assert raw_secret[4:] not in mv
 
