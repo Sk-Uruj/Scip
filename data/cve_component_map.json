@@ -1,0 +1,5 @@
+{
+    "django": {
+        "GeoDjango": ["django.contrib.gis"]
+    }
+}

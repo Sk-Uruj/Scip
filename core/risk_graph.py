@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -103,6 +104,11 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                         pkg_id = f"pkg::{top_pkg.lower()}"
                         self.graph.add_node(pkg_id, kind="PACKAGE", label=top_pkg, is_test=self.is_test)
                         self.graph.add_edge(self.module_node_id, pkg_id, kind="IMPORTS")
+                        
+                        if pkg_or_mod != top_pkg:
+                            full_pkg_id = f"pkg::{pkg_or_mod.lower()}"
+                            self.graph.add_node(full_pkg_id, kind="PACKAGE", label=pkg_or_mod, is_test=self.is_test)
+                            self.graph.add_edge(self.module_node_id, full_pkg_id, kind="IMPORTS")
                     else:
                         target_mod_id = f"module::{self.module_to_file[top_pkg]}"
                         self.graph.add_edge(self.module_node_id, target_mod_id, kind="IMPORTS")
@@ -123,6 +129,12 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     self.imported_symbols[local_symbol] = (mod, alias.name)
                     sub_mod = f"{mod}.{alias.name}" if mod else alias.name
                     self.imported_modules[local_symbol] = sub_mod
+                    
+                    if top_pkg and top_pkg not in self.module_to_file:
+                        if sub_mod != top_pkg:
+                            full_pkg_id = f"pkg::{sub_mod.lower()}"
+                            self.graph.add_node(full_pkg_id, kind="PACKAGE", label=sub_mod, is_test=self.is_test)
+                            self.graph.add_edge(self.module_node_id, full_pkg_id, kind="IMPORTS")
 
     def visit_ClassDef(self, node: ast.ClassDef):
         prev_class = self.current_class
@@ -499,6 +511,14 @@ class RiskGraph:
             "cli": 2, "cli_script": 2,
         }
 
+        cve_map = {}
+        cve_map_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cve_component_map.json")
+        try:
+            with open(cve_map_path, "r", encoding="utf-8") as file_obj:
+                cve_map = json.load(file_obj)
+        except Exception:
+            pass
+
         for f in findings:
             if not f.file:
                 continue
@@ -523,6 +543,32 @@ class RiskGraph:
 
                 f.package_imported = True
                 f.symbol_reachable = None
+
+                # Check component gating
+                package_map = cve_map.get(pkg_name, {})
+                if package_map:
+                    vulnerable_components = []
+                    for keyword, submods in package_map.items():
+                        if keyword.lower() in f.description.lower() or keyword.lower() in f.title.lower():
+                            vulnerable_components.extend(submods)
+                    
+                    if vulnerable_components:
+                        any_imported = False
+                        for comp in vulnerable_components:
+                            if self.graph.has_node(f"pkg::{comp.lower()}"):
+                                any_imported = True
+                                break
+                        if not any_imported:
+                            f.symbol_reachable = False
+                            f.fp_likelihood = "HIGH"
+                            f.fp_reason = "affected component not used"
+                            f.reachable = False
+                            f.exposure = "DEAD"
+                            f.blast_radius = 0
+                            f.extra["exposure"] = f.exposure
+                            f.extra["attack_path"] = []
+                            continue
+
                 # Check if any entrypoint can reach pkg_node using O(1) ancestor check
                 ancestors = nx.ancestors(self.graph, pkg_node)
                 reachable_paths = []

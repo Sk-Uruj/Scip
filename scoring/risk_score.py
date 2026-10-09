@@ -62,6 +62,8 @@ class ScoringConfig:
     prng_ref_id_discount: float = 0.50     # Discount for reference/display IDs vs security tokens (0.1 to 1.0)
     rotated_factor: float = 0.20           # Multiplier for confirmed rotated credentials (0.05 to 1.0)
     live_verified_factor: float = 1.50     # Multiplier for confirmed live credentials (1.0 to 3.0)
+    unevaluated_status_factor: float = 0.50 # Discount for unevaluated advisory status (0.1 to 1.0)
+    unknown_status_factor: float = 0.80    # Discount for unknown advisory status (0.1 to 1.0)
 
     def __post_init__(self):
         if not (0.05 <= self.fp_damping_factor <= 1.0):
@@ -88,6 +90,10 @@ class ScoringConfig:
             raise ValueError(f"rotated_factor must be between 0.05 and 1.0, got {self.rotated_factor}")
         if not (1.0 <= self.live_verified_factor <= 3.0):
             raise ValueError(f"live_verified_factor must be between 1.0 and 3.0, got {self.live_verified_factor}")
+        if not (0.1 <= self.unevaluated_status_factor <= 1.0):
+            raise ValueError(f"unevaluated_status_factor must be between 0.1 and 1.0, got {self.unevaluated_status_factor}")
+        if not (0.1 <= self.unknown_status_factor <= 1.0):
+            raise ValueError(f"unknown_status_factor must be between 0.1 and 1.0, got {self.unknown_status_factor}")
 
 
 DEFAULT_SCORING_CONFIG = ScoringConfig()
@@ -259,14 +265,22 @@ def calculate_finding_risk_score(
         risk_score = round(risk_score * config.prng_ref_id_discount, 2)
         ref_id_note = f", PRNG Ref-ID: {config.prng_ref_id_discount:.2f}x"
 
-    # 9. Rotation & Live Verification overrides
+    # 9. Rotation, Live Verification, and Advisory Status overrides
     status_note = ""
     if extra.get("rotated"):
         risk_score = round(risk_score * config.rotated_factor, 2)
-        status_note = f", Rotated: {config.rotated_factor:.2f}x"
+        status_note += f", Rotated: {config.rotated_factor:.2f}x"
     elif extra.get("live_verified"):
         risk_score = round(min(100.0, risk_score * config.live_verified_factor), 2)
-        status_note = f", Live Verified: {config.live_verified_factor:.2f}x"
+        status_note += f", Live Verified: {config.live_verified_factor:.2f}x"
+        
+    affected_status = extra.get("affected_status", "confirmed").lower()
+    if affected_status == "unevaluated":
+        risk_score = round(risk_score * config.unevaluated_status_factor, 2)
+        status_note += f", Unevaluated: {config.unevaluated_status_factor:.2f}x"
+    elif affected_status == "unknown":
+        risk_score = round(risk_score * config.unknown_status_factor, 2)
+        status_note += f", Status Unknown: {config.unknown_status_factor:.2f}x"
 
     # 10. Graded Seed & Verified False Positive Damping
     fp_likely = getattr(f, "fp_likelihood", None) or extra.get("fp_likelihood")
