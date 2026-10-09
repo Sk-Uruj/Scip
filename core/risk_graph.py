@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -103,6 +104,11 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                         pkg_id = f"pkg::{top_pkg.lower()}"
                         self.graph.add_node(pkg_id, kind="PACKAGE", label=top_pkg, is_test=self.is_test)
                         self.graph.add_edge(self.module_node_id, pkg_id, kind="IMPORTS")
+                        
+                        if pkg_or_mod != top_pkg:
+                            full_pkg_id = f"pkg::{pkg_or_mod.lower()}"
+                            self.graph.add_node(full_pkg_id, kind="PACKAGE", label=pkg_or_mod, is_test=self.is_test)
+                            self.graph.add_edge(self.module_node_id, full_pkg_id, kind="IMPORTS")
                     else:
                         target_mod_id = f"module::{self.module_to_file[top_pkg]}"
                         self.graph.add_edge(self.module_node_id, target_mod_id, kind="IMPORTS")
@@ -123,6 +129,12 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     self.imported_symbols[local_symbol] = (mod, alias.name)
                     sub_mod = f"{mod}.{alias.name}" if mod else alias.name
                     self.imported_modules[local_symbol] = sub_mod
+                    
+                    if top_pkg and top_pkg not in self.module_to_file:
+                        if sub_mod != top_pkg:
+                            full_pkg_id = f"pkg::{sub_mod.lower()}"
+                            self.graph.add_node(full_pkg_id, kind="PACKAGE", label=sub_mod, is_test=self.is_test)
+                            self.graph.add_edge(self.module_node_id, full_pkg_id, kind="IMPORTS")
 
     def visit_ClassDef(self, node: ast.ClassDef):
         prev_class = self.current_class
@@ -260,9 +272,9 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 if isinstance(d, ast.Call):
                     func_id_name = getattr(d.func, "id", "") or getattr(d.func, "attr", "")
                     if func_id_name == "Depends" and d.args:
-                        dep_target, _ = self._resolve_callee(d.args[0])
+                        dep_target, is_h, res_method = self._resolve_callee(d.args[0])
                         if dep_target:
-                            self.graph.add_edge(func_id, dep_target, kind="CALLS")
+                            self.graph.add_edge(func_id, dep_target, kind="CALLS", confidence="heuristic" if is_h else "exact", resolution=res_method)
 
             # Check parameter type annotations: Annotated[Session, Depends(get_db)]
             all_param_args = getattr(args_node, "args", []) + getattr(args_node, "kwonlyargs", [])
@@ -273,26 +285,22 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                         if isinstance(sub, ast.Call):
                             call_name = getattr(sub.func, "id", "") or getattr(sub.func, "attr", "")
                             if call_name == "Depends" and sub.args:
-                                dep_target, _ = self._resolve_callee(sub.args[0])
+                                dep_target, is_h, res_method = self._resolve_callee(sub.args[0])
                                 if dep_target:
-                                    self.graph.add_edge(func_id, dep_target, kind="CALLS")
+                                    self.graph.add_edge(func_id, dep_target, kind="CALLS", confidence="heuristic" if is_h else "exact", resolution=res_method)
 
     def visit_Call(self, node: ast.Call):
         if self.current_function:
-            callee_id, is_heuristic = self._resolve_callee(node.func)
+            callee_id, is_heuristic, res_method = self._resolve_callee(node.func)
             if callee_id:
-                edge_attrs = {"kind": "CALLS"}
-                if is_heuristic:
-                    edge_attrs["confidence"] = "heuristic"
+                edge_attrs = {"kind": "CALLS", "resolution": res_method, "confidence": "heuristic" if is_heuristic else "exact"}
                 self.graph.add_edge(self.current_function, callee_id, **edge_attrs)
             # Resolve Thread(target=...), add_job(func=...), etc.
             for kw in getattr(node, "keywords", []):
                 if kw.arg in ("target", "func", "callback") and isinstance(kw.value, (ast.Name, ast.Attribute)):
-                    kw_callee, is_h = self._resolve_callee(kw.value)
+                    kw_callee, is_h, res_method = self._resolve_callee(kw.value)
                     if kw_callee:
-                        edge_attrs = {"kind": "CALLS"}
-                        if is_h:
-                            edge_attrs["confidence"] = "heuristic"
+                        edge_attrs = {"kind": "CALLS", "resolution": res_method, "confidence": "heuristic" if is_h else "exact"}
                         self.graph.add_edge(self.current_function, kw_callee, **edge_attrs)
         self.generic_visit(node)
 
@@ -373,19 +381,19 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             )
             self.graph.add_edge(ep_id, self.module_node_id, kind="EXPOSES")
 
-    def _resolve_callee(self, func_node: ast.AST) -> Tuple[Optional[str], bool]:
+    def _resolve_callee(self, func_node: ast.AST) -> Tuple[Optional[str], bool, str]:
         if isinstance(func_node, ast.Name):
             name = func_node.id
             if name in self.imported_symbols:
                 mod, orig_name = self.imported_symbols[name]
                 if mod in self.module_to_file:
                     target_file = self.module_to_file[mod]
-                    return f"{target_file}::{orig_name}", False
+                    return f"{target_file}::{orig_name}", False, "exact_import"
                 else:
                     top_pkg = mod.split(".")[0].lower() if mod else name.lower()
-                    return f"pkg::{top_pkg}", False
+                    return f"pkg::{top_pkg}", False, "external_import"
             elif name in self.local_functions:
-                return f"{self.file_path}::{name}", False
+                return f"{self.file_path}::{name}", False, "local_function"
 
         elif isinstance(func_node, ast.Attribute):
             attr = func_node.attr
@@ -395,14 +403,14 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     mod = self.imported_modules[val_id]
                     if mod in self.module_to_file:
                         target_file = self.module_to_file[mod]
-                        return f"{target_file}::{attr}", False
+                        return f"{target_file}::{attr}", False, "exact_import_attribute"
                     else:
                         top_pkg = mod.split(".")[0].lower()
-                        return f"pkg::{top_pkg}", False
+                        return f"pkg::{top_pkg}", False, "external_import_attribute"
                 elif val_id in ("self", "cls"):
                     if self.current_class:
-                        return f"{self.file_path}::{self.current_class}.{attr}", False
-                    return f"{self.file_path}::{attr}", False
+                        return f"{self.file_path}::{self.current_class}.{attr}", False, "local_class_method"
+                    return f"{self.file_path}::{attr}", False, "local_attribute"
                 else:
                     # obj.method() - resolve methods matching attr via tracked local instance types
                     cls_type = self.var_types.get(val_id)
@@ -411,11 +419,11 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                             mod, orig_cls = self.imported_symbols[cls_type]
                             target_file = self.module_to_file.get(mod)
                             if target_file:
-                                return f"{target_file}::{orig_cls}.{attr}", True
+                                return f"{target_file}::{orig_cls}.{attr}", True, "heuristic_type_match"
                         elif cls_type in self.local_classes:
-                            return f"{self.file_path}::{cls_type}.{attr}", True
+                            return f"{self.file_path}::{cls_type}.{attr}", True, "heuristic_local_type_match"
 
-        return None, False
+        return None, False, ""
 
 
 class RiskGraph:
@@ -503,6 +511,14 @@ class RiskGraph:
             "cli": 2, "cli_script": 2,
         }
 
+        cve_map = {}
+        cve_map_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cve_component_map.json")
+        try:
+            with open(cve_map_path, "r", encoding="utf-8") as file_obj:
+                cve_map = json.load(file_obj)
+        except Exception:
+            pass
+
         for f in findings:
             if not f.file:
                 continue
@@ -515,6 +531,8 @@ class RiskGraph:
                 pkg_node = f"pkg::{pkg_name}"
 
                 if not self.graph.has_node(pkg_node):
+                    f.package_imported = False
+                    f.symbol_reachable = None
                     # Package is in requirements.txt but NEVER imported anywhere in application code
                     f.reachable = False
                     f.exposure = "DEAD"
@@ -522,6 +540,34 @@ class RiskGraph:
                     f.extra["exposure"] = f.exposure
                     f.extra["attack_path"] = []
                     continue
+
+                f.package_imported = True
+                f.symbol_reachable = None
+
+                # Check component gating
+                package_map = cve_map.get(pkg_name, {})
+                if package_map:
+                    vulnerable_components = []
+                    for keyword, submods in package_map.items():
+                        if keyword.lower() in f.description.lower() or keyword.lower() in f.title.lower():
+                            vulnerable_components.extend(submods)
+                    
+                    if vulnerable_components:
+                        any_imported = False
+                        for comp in vulnerable_components:
+                            if self.graph.has_node(f"pkg::{comp.lower()}"):
+                                any_imported = True
+                                break
+                        if not any_imported:
+                            f.symbol_reachable = False
+                            f.fp_likelihood = "HIGH"
+                            f.fp_reason = "affected component not used"
+                            f.reachable = False
+                            f.exposure = "DEAD"
+                            f.blast_radius = 0
+                            f.extra["exposure"] = f.exposure
+                            f.extra["attack_path"] = []
+                            continue
 
                 # Check if any entrypoint can reach pkg_node using O(1) ancestor check
                 ancestors = nx.ancestors(self.graph, pkg_node)
@@ -664,10 +710,19 @@ class RiskGraph:
                 elif len(prod_callers) == 0 and not is_ep:
                     f.reachable = False
                     f.exposure = "DEAD"
+                    if f.fp_likelihood is None:
+                        f.fp_likelihood = "HIGH"
+                        f.fp_reason = "Unreachable dead code (zero known callers)"
                 else:
                     # Proven analyzed: internal callers exist, but zero entrypoint ingress paths
                     f.reachable = False
                     f.exposure = "INTNL"
+                    if f.fp_likelihood is None:
+                        f.fp_likelihood = "MEDIUM"
+                        f.fp_reason = "No entrypoint ingress path (internal-only)"
+
+                f.symbol_reachable = f.reachable
+                f.package_imported = None
 
                 f.extra["exposure"] = f.exposure
                 f.extra["attack_path"] = []

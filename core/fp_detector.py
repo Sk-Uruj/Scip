@@ -37,57 +37,6 @@ DDL_SQL_PATTERNS = [
     re.compile(r"\bPRAGMA\b", re.IGNORECASE),
 ]
 
-SEED_FILE_PATTERNS = [
-    re.compile(r"\binit_db\.py$", re.IGNORECASE),
-    re.compile(r"\bseed.*\.py$", re.IGNORECASE),
-    re.compile(r"\bfixtures?.*\.py$", re.IGNORECASE),
-    re.compile(r"\bdb_init\.py$", re.IGNORECASE),
-]
-
-SEED_VAR_PATTERNS = [
-    re.compile(r"\bSEED_", re.IGNORECASE),
-    re.compile(r"\bDEMO_", re.IGNORECASE),
-    re.compile(r"\bFIXTURE_", re.IGNORECASE),
-    re.compile(r"\bDEFAULT_USERS?\b", re.IGNORECASE),
-    re.compile(r"\bSAMPLE_ACCOUNTS?\b", re.IGNORECASE),
-]
-
-PROD_NEGATIVE_PATTERN = re.compile(r"(?:\b|_)(prod|production|live|staging|stage|stg|release)(?:\b|_)", re.IGNORECASE)
-DEV_POSITIVE_PATTERN = re.compile(r"(?:\b|_)(dev|development|test|mock|demo|local|sample|example)(?:\b|_)", re.IGNORECASE)
-
-DEMO_WORDLIST = {
-    "alice123", "bob123", "bob456", "carol789", "admin", "password", "changeme",
-    "testpass", "demo", "dev", "123456", "secret", "root", "guest", "default", "test"
-}
-
-NEGATIVE_GATE_PATTERNS = [
-    re.compile(r"(!=\s*[\"'](?:dev|test|local)[\"'])", re.IGNORECASE),
-    re.compile(r"(not\s+in\s*[\(\[][^)]*[\"'](?:dev|test|local)[\"'])", re.IGNORECASE),
-    re.compile(r"(\bif\s+not\s+.*(?:DEBUG|debug|ENV|env)\b)", re.IGNORECASE),
-    re.compile(r"((?:DEBUG|debug)\s*(?:==|\bis\b)\s*False\b)", re.IGNORECASE),
-    re.compile(r"((?:DEBUG|debug)\s*!=\s*(?:1|True|true)\b)", re.IGNORECASE),
-    re.compile(r"(os\.(?:environ\.get|getenv)\([\"'](?:DEBUG|ENV)[\"']\)\s*!=\s*[\"']?(?:1|true|dev|test)[\"']?)", re.IGNORECASE),
-]
-
-POSITIVE_GATE_PATTERNS = [
-    re.compile(r"--seed\b", re.IGNORECASE),
-    re.compile(r"\bif\s+(?:DEBUG|debug)\b", re.IGNORECASE),
-    re.compile(r"\bif\s+.*env.*(?:==|\bin\b)\s*[\"'](dev|test|local|sample)[\"']", re.IGNORECASE),
-    re.compile(r"os\.(?:environ\.get|getenv)\([\"'](DEBUG|ENV)[\"']\)", re.IGNORECASE),
-    re.compile(r"SELECT\s+COUNT\b", re.IGNORECASE),
-    re.compile(r"\bif\s+not\s+.*count\b", re.IGNORECASE),
-]
-
-
-def _is_dev_gated(block_text: str) -> bool:
-    """Evaluate whether an enclosing block is gated for dev/seed execution with correct polarity."""
-    if not block_text:
-        return False
-    # Negative polarity checks immediately disqualify the gate (e.g. if env != "dev" means prod!)
-    if any(p.search(block_text) for p in NEGATIVE_GATE_PATTERNS):
-        return False
-    return any(p.search(block_text) for p in POSITIVE_GATE_PATTERNS)
-
 
 CI_AND_CONFIG_FILES = (
     "docker-compose", ".env", "jenkinsfile", ".gitlab-ci", "workflow", "config.", "settings."
@@ -115,24 +64,7 @@ SKIP_DIRS = {
 }
 
 
-def _get_repo_prod_files(repo_path: str) -> List[Tuple[str, str]]:
-    """Index non-fixture production code and CI configs in repo, skipping virtualenvs and git."""
-    contents: List[Tuple[str, str]] = []
-    repo = Path(repo_path).resolve()
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-        for fn in files:
-            low_fn = fn.lower()
-            rel_p = os.path.relpath(os.path.join(root, fn), repo).replace("\\", "/").removeprefix("./")
-            if any(p.search(fn) for p in SEED_FILE_PATTERNS) or rel_p.startswith("seeds/") or "/seeds/" in rel_p or rel_p.startswith("fixtures/") or "/fixtures/" in rel_p or is_test_path(rel_p):
-                continue
-            if low_fn.endswith((".py", ".env", ".yml", ".yaml", ".json", ".toml", ".ini", ".conf", ".sh")) or any(c in low_fn for c in CI_AND_CONFIG_FILES):
-                try:
-                    with open(os.path.join(root, fn), "r", encoding="utf-8", errors="ignore") as fh:
-                        contents.append((rel_p, fh.read()))
-                except Exception:
-                    pass
-    return contents
+
 
 
 def _get_enclosing_block_text(file_lines: List[str], line_no: Optional[int], full_path: Optional[str]) -> str:
@@ -469,8 +401,7 @@ def is_provider_format_secret(f: Finding, line_text: str = "") -> bool:
 
 def _detect_single_finding_fp(
     f: Finding,
-    repo_path: Optional[str],
-    prod_files: Optional[List[Tuple[str, str]]]
+    repo_path: Optional[str]
 ) -> None:
     """Evaluate a single finding for false-positive indicators."""
     evidence = f.evidence or ""
@@ -500,6 +431,29 @@ def _detect_single_finding_fp(
     else:
         line_text = evidence
 
+    # 0. Intent/context classifier (training, example, intentionally vulnerable code)
+    is_training_path = False
+    for path_marker in ("dockerized_labs/", "examples/", "docs/", "training/", "tutorial/"):
+        if path_marker in norm_file:
+            is_training_path = True
+            break
+            
+    has_vulnerable_comment = False
+    if file_lines and f.line:
+        s_idx = max(0, f.line - 5)
+        e_idx = min(len(file_lines), f.line + 3)
+        window = "".join(file_lines[s_idx:e_idx])
+        if re.search(r"#\s*vulnerable:?", window, re.IGNORECASE) or re.search(r"intentionally vulnerable", window, re.IGNORECASE):
+            has_vulnerable_comment = True
+            
+    if is_training_path or has_vulnerable_comment:
+        f.fp_likelihood = "HIGH"
+        f.fp_reason = "Intent classified as training/example code"
+        f.extra["damping_multiplier"] = 0.1
+        f.extra["fp_likelihood"] = f.fp_likelihood
+        f.extra["fp_reason"] = f.fp_reason
+        return
+
     # 1. Test suite mock passwords / secret fixtures
     # Exempt provider-format keys (e.g. AKIA...) and damp only generic passwords
     is_test = is_test_path(f.file) or f.exposure == "TEST"
@@ -516,115 +470,6 @@ def _detect_single_finding_fp(
             f.extra["fp_reason"] = f.fp_reason
             return
 
-    # 2. Database bootstrap seed credentials / demo fixtures (CWE-1188) with mandatory env and cross guards
-    is_seed_file = (
-        any(p.search(norm_file) for p in SEED_FILE_PATTERNS)
-        or norm_file.startswith("seeds/") or "/seeds/" in norm_file
-        or norm_file.startswith("fixtures/") or "/fixtures/" in norm_file
-    )
-    is_credential = (
-        f.cwe in ("CWE-259", "CWE-798", "CWE-1188")
-        or f.engine == "secrets"
-        or (f.engine == "bandit" and (f.cwe in ("CWE-259", "CWE-798") or any(b in title for b in ("B105", "B106", "B107"))))
-    )
-
-    if is_seed_file and is_credential:
-        matches_seed_var = any(p.search(evidence) for p in SEED_VAR_PATTERNS)
-        if not matches_seed_var and file_lines and f.line:
-            start_l = max(0, f.line - 15)
-            end_l = min(len(file_lines), f.line + 5)
-            window = "".join(file_lines[start_l:end_l])
-            matches_seed_var = any(p.search(window) for p in SEED_VAR_PATTERNS)
-
-        # Guard 1: Environment guard - Fail-closed: Must have positive dev signal AND no negative prod/staging signal
-        search_text = f"{line_text} {evidence} {f.extra.get('variable', '')}"
-        has_dev_signal = bool(DEV_POSITIVE_PATTERN.search(search_text))
-        has_prod_signal = bool(PROD_NEGATIVE_PATTERN.search(search_text))
-        g_env = has_dev_signal and not has_prod_signal
-
-        # Guard 2: Demo Pattern guard - Strictly verify against demo wordlist and patterns
-        val_candidates = re.findall(
-            r"(?:password|passwd|secret|token|api_key|key|pw)[\"'\s:=]+[\"']([^\"']+)[\"']",
-            line_text + " " + evidence,
-            re.IGNORECASE,
-        )
-        if not val_candidates:
-            val_candidates = (
-                re.findall(r":\s*[\"']([^\"']+)[\"']", line_text + " " + evidence)
-                or re.findall(r"=\s*[\"']([^\"']+)[\"']", line_text + " " + evidence)
-            )
-
-        g_demo = False
-        for cand in val_candidates:
-            cand_lower = cand.lower().strip()
-            if cand_lower in DEMO_WORDLIST or re.match(r"^[a-zA-Z]+123$", cand_lower) or re.match(r"^test[a-zA-Z0-9]*$", cand_lower):
-                g_demo = True
-                break
-
-        # Guard 3: Gating guard - Scoped strictly to the enclosing seed block/function with polarity validation
-        is_pure_fixture_dir = (
-            norm_file.startswith("seeds/") or "/seeds/" in norm_file
-            or norm_file.startswith("fixtures/") or "/fixtures/" in norm_file
-            or norm_file.startswith("tests/") or "/tests/" in norm_file
-        )
-        if is_pure_fixture_dir:
-            g_gate = True
-        else:
-            block_text = _get_enclosing_block_text(file_lines, f.line, full_path)
-            g_gate = _is_dev_gated(block_text)
-
-        # Guard 4: Cross-file guard - In-memory secret value search across production files
-        valid_candidates = [
-            v.strip() for v in val_candidates
-            if len(v.strip()) >= 6 and not v.strip().startswith("{") and not v.strip().endswith("}")
-        ]
-
-        if not valid_candidates:
-            # Fails closed if candidate secret value is missing or shorter than 6 characters
-            g_cross = False
-        else:
-            in_prod = False
-            if prod_files:
-                for rel_p, content in prod_files:
-                    if rel_p == norm_file:
-                        continue
-                    for cand in valid_candidates:
-                        if cand in content:
-                            in_prod = True
-                            break
-                    if in_prod:
-                        break
-            g_cross = not in_prod
-
-        guards_passed = sum(1 for g in (g_env, g_demo, g_gate, g_cross) if g)
-
-        # STRICT REQUIREMENTS:
-        # 1. Environment (g_env) and cross-file (g_cross) checks are strictly mandatory.
-        # 2. Demo-value guard (g_demo) is strictly required for ANY damping.
-        #    A random/production-like password behind DEBUG is still a readable committed secret.
-        #    Only g_demo guarantees the value itself is a throwaway mock/demo fixture.
-        if (matches_seed_var or is_seed_file):
-            if g_env and g_cross and g_demo:
-                if g_gate:
-                    f.fp_likelihood = "HIGH"
-                    f.fp_reason = "Database bootstrap seed credentials / demo fixture (all 4 guards passed)"
-                    f.extra["fp_likelihood"] = f.fp_likelihood
-                    f.extra["fp_reason"] = f.fp_reason
-                    f.extra["seed_classification"] = "SEED_FULL"
-                    f.extra["guard_note"] = f"Guarded seed fixture (4/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
-                    return
-                else:
-                    f.fp_likelihood = "MEDIUM"
-                    f.fp_reason = "Database bootstrap fixture (mild damping: 3/4 guards passed, missing runtime gate)"
-                    f.extra["fp_likelihood"] = f.fp_likelihood
-                    f.extra["fp_reason"] = f.fp_reason
-                    f.extra["seed_classification"] = "SEED_PARTIAL"
-                    f.extra["guard_note"] = f"Partially guarded seed fixture (3/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
-                    return
-            else:
-                f.extra["seed_classification"] = "NOT_SEED"
-                f.extra["damping_multiplier"] = 1.0
-                f.extra["guard_note"] = f"Unguarded credential ({guards_passed}/4 guards passed: env={g_env}, demo={g_demo}, gate={g_gate}, cross={g_cross})"
 
     # 3. Protocol-mandated S3 ETags (RFC 7232 MD5 checksum)
     # Require weak-hash finding (B324, CWE-327/328) AND etag signal in enclosing function, nearby code, or description.
@@ -689,16 +534,9 @@ def _detect_single_finding_fp(
 
 def detect_false_positives(findings: List[Finding], repo_path: Optional[str] = None) -> List[Finding]:
     """Inspect findings and tag high-confidence false positive and seed patterns."""
-    prod_files: Optional[List[Tuple[str, str]]] = None
-    if repo_path and os.path.isdir(repo_path):
-        try:
-            prod_files = _get_repo_prod_files(repo_path)
-        except Exception as exc:
-            log.warning("Failed pre-indexing repository production files: %s", exc)
-
     for f in findings:
         try:
-            _detect_single_finding_fp(f, repo_path, prod_files)
+            _detect_single_finding_fp(f, repo_path)
         except Exception as exc:
             loc = f"{getattr(f, 'file', '')}:{getattr(f, 'line', '')}"
             log.warning("False-positive evaluation failed for finding '%s' at %s: %s", getattr(f, "title", "finding"), loc, exc)
