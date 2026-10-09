@@ -140,8 +140,8 @@ def test_deduplicate_findings_merges_and_boosts():
 
     top = merged[0]
     assert top.line == 11
-    # Severity should be max(5.5, 8.5) + 0.3 corroboration bonus = 8.8
-    assert top.severity == 8.8
+    # Severity should be max(5.5, 8.5) (no longer bumped by 0.3)
+    assert top.severity == 8.5
     assert top.exploitability == 0.75
     assert top.cwe == "CWE-502"
     assert top.extra["corroborated"] is True

@@ -478,3 +478,56 @@ class ProcessService:
         assert any("(heuristic)" in p for p in path)
 
 
+def test_dependency_component_gating():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Create a repo that imports django but NOT django.contrib.gis
+        code = """
+import django.db.models
+from django.conf import settings
+
+def some_func():
+    pass
+"""
+        with open(os.path.join(tmpdir, "main.py"), "w") as f:
+            f.write(code)
+            
+        rg = RiskGraph(tmpdir).build(force_rebuild=True)
+        
+        # Test CVE without the component imported
+        finding1 = Finding(
+            engine="dependency",
+            title="CVE-2023-XXXX: SQL Injection in GeoDjango",
+            description="A vulnerability in GeoDjango allows...",
+            file="requirements.txt",
+            extra={"package": "django"}
+        )
+        rg.analyze_reachability([finding1])
+        
+        assert getattr(finding1, "package_imported", False) is True
+        assert getattr(finding1, "symbol_reachable", None) is False
+        assert finding1.fp_likelihood == "HIGH"
+        assert "affected component not used" in finding1.fp_reason
+        
+        # Now create code that DOES import it
+        code_gis = """
+import django.contrib.gis
+
+def some_gis_func():
+    pass
+"""
+        with open(os.path.join(tmpdir, "gis.py"), "w") as f:
+            f.write(code_gis)
+            
+        rg2 = RiskGraph(tmpdir).build(force_rebuild=True)
+        finding2 = Finding(
+            engine="dependency",
+            title="CVE-2023-XXXX: SQL Injection in GeoDjango",
+            description="A vulnerability in GeoDjango allows...",
+            file="requirements.txt",
+            extra={"package": "django"}
+        )
+        rg2.analyze_reachability([finding2])
+        
+        assert getattr(finding2, "package_imported", False) is True
+        assert getattr(finding2, "symbol_reachable", False) is None
+        assert finding2.fp_likelihood is None

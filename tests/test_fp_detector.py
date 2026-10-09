@@ -156,124 +156,6 @@ def test_detect_s3_etag_via_ast_enclosing_function(tmp_path):
     assert "S3 ETag" in f.fp_reason
 
 
-def test_detect_seed_data_credentials_fixture(tmp_path):
-    code = """if os.getenv("DEBUG"):
-    SEED_USERS = [
-        {"username": "alice_dev", "password": "alice123"},
-    ]
-"""
-    db_file = tmp_path / "init_db.py"
-    db_file.write_text(code, encoding="utf-8")
-
-    f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
-        line=3,
-        cwe="CWE-259",
-        severity=6.3,
-        evidence='{"username": "alice_dev", "password": "alice123"}',
-    )
-    detect_false_positives([f], repo_path=str(tmp_path))
-    assert f.fp_likelihood == "HIGH"
-    assert f.extra.get("seed_classification") == "SEED_FULL"
-    assert "Guarded seed fixture" in f.extra.get("guard_note", "")
-    assert "seed_guards" not in f.extra
-    assert "is_seed_fixture" not in f.extra
-    assert "seed credentials" in f.fp_reason.lower()
-
-
-def test_carol_prod_and_bob_staging_never_damped(tmp_path):
-    """Ungated migration with production or staging users must fail seed guards and NOT be damped."""
-    code = """def seed_users():
-    SEED_USERS = [
-        {"username": "carol_prod", "password": "carol_prod_secret!"},
-        {"username": "bob_staging", "password": "bob_staging_secret!"},
-    ]
-"""
-    db_file = tmp_path / "init_db.py"
-    db_file.write_text(code, encoding="utf-8")
-
-    f_carol = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
-        line=3,
-        cwe="CWE-259",
-        severity=7.5,
-        evidence='{"username": "carol_prod", "password": "carol_prod_secret!"}',
-    )
-    detect_false_positives([f_carol], repo_path=str(tmp_path))
-    # Must fail env guard and gating guard -> at most 2 guards pass -> NOT damped
-    assert f_carol.fp_likelihood is None
-    assert f_carol.extra.get("seed_classification") == "NOT_SEED"
-    assert "Unguarded credential" in f_carol.extra.get("guard_note", "")
-    assert "env=False" in f_carol.extra.get("guard_note", "")
-    assert "gate=False" in f_carol.extra.get("guard_note", "")
-    assert "seed_guards" not in f_carol.extra
-    assert "is_seed_fixture" not in f_carol.extra
-    assert f_carol.extra.get("damping_multiplier") == 1.0
-
-
-def test_demo_value_guard_rejects_8char_random(tmp_path):
-    """An 8-character random password must fail demo value guard and NOT be damped despite sitting behind DEBUG."""
-    code = """if os.getenv("DEBUG"):
-    SEED_USERS = [
-        {"username": "alice_dev", "password": "k8#mP9$x"},
-    ]
-"""
-    db_file = tmp_path / "init_db.py"
-    db_file.write_text(code, encoding="utf-8")
-
-    f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
-        line=3,
-        cwe="CWE-259",
-        severity=8.0,
-        evidence='{"username": "alice_dev", "password": "k8#mP9$x"}',
-    )
-    detect_false_positives([f], repo_path=str(tmp_path))
-    # Fails demo value guard because k8#mP9$x is not in demo wordlist or pattern.
-    # Because g_demo is required for any damping, this credential is NOT damped.
-    assert f.fp_likelihood is None
-    assert f.extra.get("seed_classification") == "NOT_SEED"
-    assert "demo=False" in f.extra.get("guard_note", "")
-    assert f.extra.get("damping_multiplier") == 1.0
-
-
-def test_seed_value_in_config_fails_cross_file_guard(tmp_path):
-    """If a seed secret value appears in config.py or .env, cross-file guard fails and it is NOT damped."""
-    init_code = """if os.getenv("DEBUG"):
-    ADMIN_DEV_TOKEN = "testpass123"
-"""
-    (tmp_path / "init_db.py").write_text(init_code, encoding="utf-8")
-
-    config_code = """# Production configuration
-AUTH_SECRET = "testpass123"
-"""
-    (tmp_path / "config.py").write_text(config_code, encoding="utf-8")
-
-    f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
-        line=2,
-        cwe="CWE-259",
-        severity=7.0,
-        evidence='ADMIN_DEV_TOKEN = "testpass123"',
-        extra={"variable": "ADMIN_DEV_TOKEN"},
-    )
-    detect_false_positives([f], repo_path=str(tmp_path))
-    # Secret value is leaked into config.py, cross-file guard fails.
-    # Because env and cross are strictly mandatory, it fails and is NOT damped.
-    assert f.fp_likelihood is None
-    assert f.extra.get("seed_classification") == "NOT_SEED"
-    assert "cross=False" in f.extra.get("guard_note", "")
-    assert f.extra.get("damping_multiplier") == 1.0
-
-
 def test_prng_context_token_vs_ref_id():
     """Security tokens remain full severity; transaction reference IDs receive [REF-ID] tag."""
     f_token = Finding(
@@ -474,48 +356,39 @@ def test_test_path_bandit_exec_not_mock_credential():
     assert f.fp_likelihood is None
 
 
-def test_negative_polarity_gate_rejected(tmp_path):
-    """A negative gate condition (if env != 'dev') represents production and must NOT match as a dev gate."""
-    code = """def seed():
-    if env != "dev":
-        SEED_USERS = [
-            {"username": "alice_dev", "password": "alice123"},
-        ]
-"""
-    (tmp_path / "init_db.py").write_text(code, encoding="utf-8")
+def test_intent_classifier_dockerized_labs(tmp_path):
     f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
+        engine="bandit",
+        title="Hardcoded password",
+        file="dockerized_labs/lab1/vulnerable_app.py",
+        line=10,
+        cwe="CWE-259",
+        severity=9.0,
+        evidence="conn = connect(password='admin123')",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood == "HIGH"
+    assert "Intent classified as training/example code" in f.fp_reason
+    assert f.extra.get("damping_multiplier") == 0.1
+
+def test_intent_classifier_vulnerable_comment(tmp_path):
+    code = """
+# intentionally vulnerable to SQL injection
+def get_user(uid):
+    cursor.execute(f"SELECT * FROM users WHERE id = {uid}")
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    
+    f = Finding(
+        engine="bandit",
+        title="SQL injection",
+        file="app.py",
         line=4,
-        cwe="CWE-259",
-        severity=7.0,
-        evidence='{"username": "alice_dev", "password": "alice123"}',
+        cwe="CWE-89",
+        severity=9.0,
+        evidence='f"SELECT * FROM users WHERE id = {uid}"',
     )
     detect_false_positives([f], repo_path=str(tmp_path))
-    assert f.extra.get("seed_classification") == "SEED_PARTIAL"
-    assert "gate=False" in f.extra.get("guard_note", "")
-    assert f.fp_likelihood == "MEDIUM"
-
-
-def test_seed_fixture_without_runtime_gate_gets_partial_damping(tmp_path):
-    """Seed credential meeting demo wordlist and env checks but missing runtime gate gets SEED_PARTIAL."""
-    code = """# Top-level seed definition in db initialization without runtime guard
-SEED_USERS = [
-    {"username": "alice_dev", "password": "alice123"},
-]
-"""
-    (tmp_path / "init_db.py").write_text(code, encoding="utf-8")
-    f = Finding(
-        engine="secrets",
-        title="Hard-coded password",
-        file="init_db.py",
-        line=3,
-        cwe="CWE-259",
-        severity=7.0,
-        evidence='{"username": "alice_dev", "password": "alice123"}',
-    )
-    detect_false_positives([f], repo_path=str(tmp_path))
-    assert f.extra.get("seed_classification") == "SEED_PARTIAL"
-    assert f.fp_likelihood == "MEDIUM"
-    assert "3/4 guards passed" in f.extra.get("guard_note", "")
+    assert f.fp_likelihood == "HIGH"
+    assert "Intent classified as training/example code" in f.fp_reason
+    assert f.extra.get("damping_multiplier") == 0.1

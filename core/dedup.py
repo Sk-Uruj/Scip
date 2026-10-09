@@ -132,10 +132,6 @@ def _merge_pair(base: Finding, incoming: Finding) -> Finding:
     max_sev = max(base.severity, incoming.severity)
     is_corroborated = len(all_engines) > 1
 
-    # Corroboration confidence bonus: +0.3 severity boost (max 10.0) if verified by distinct active engines
-    if is_corroborated and not (base_suppressed or incoming_suppressed) and not base.extra.get("corroborated"):
-        max_sev = min(10.0, round(max_sev + 0.3, 1))
-
     # Slim source tracking (avoid bloating output with full dict copies)
     sources = list(base.extra.get("sources") or [_slim_source(base)])
     sources.append(_slim_source(incoming))
