@@ -42,6 +42,12 @@ class Finding:
                 continue
             if k in ("blast_radius", "churn", "code_health_penalty", "exploitability") and v in (0, 0.0):
                 continue
+            if k == "extra" and isinstance(v, dict):
+                v = v.copy()
+                for drop_key in ["scoring_config", "col_offset", "end_col_offset"]:
+                    v.pop(drop_key, None)
+                if not v:
+                    continue
             clean_d[k] = v
         return clean_d
 

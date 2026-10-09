@@ -710,10 +710,16 @@ class RiskGraph:
                 elif len(prod_callers) == 0 and not is_ep:
                     f.reachable = False
                     f.exposure = "DEAD"
+                    if f.fp_likelihood is None:
+                        f.fp_likelihood = "HIGH"
+                        f.fp_reason = "Unreachable dead code (zero known callers)"
                 else:
                     # Proven analyzed: internal callers exist, but zero entrypoint ingress paths
                     f.reachable = False
                     f.exposure = "INTNL"
+                    if f.fp_likelihood is None:
+                        f.fp_likelihood = "MEDIUM"
+                        f.fp_reason = "No entrypoint ingress path (internal-only)"
 
                 f.symbol_reachable = f.reachable
                 f.package_imported = None
