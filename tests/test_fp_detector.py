@@ -519,3 +519,40 @@ SEED_USERS = [
     assert f.extra.get("seed_classification") == "SEED_PARTIAL"
     assert f.fp_likelihood == "MEDIUM"
     assert "3/4 guards passed" in f.extra.get("guard_note", "")
+
+def test_intent_classifier_dockerized_labs(tmp_path):
+    f = Finding(
+        engine="bandit",
+        title="Hardcoded password",
+        file="dockerized_labs/lab1/vulnerable_app.py",
+        line=10,
+        cwe="CWE-259",
+        severity=9.0,
+        evidence="conn = connect(password='admin123')",
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood == "HIGH"
+    assert "Intent classified as training/example code" in f.fp_reason
+    assert f.extra.get("damping_multiplier") == 0.1
+
+def test_intent_classifier_vulnerable_comment(tmp_path):
+    code = """
+# intentionally vulnerable to SQL injection
+def get_user(uid):
+    cursor.execute(f"SELECT * FROM users WHERE id = {uid}")
+"""
+    (tmp_path / "app.py").write_text(code, encoding="utf-8")
+    
+    f = Finding(
+        engine="bandit",
+        title="SQL injection",
+        file="app.py",
+        line=4,
+        cwe="CWE-89",
+        severity=9.0,
+        evidence='f"SELECT * FROM users WHERE id = {uid}"',
+    )
+    detect_false_positives([f], repo_path=str(tmp_path))
+    assert f.fp_likelihood == "HIGH"
+    assert "Intent classified as training/example code" in f.fp_reason
+    assert f.extra.get("damping_multiplier") == 0.1

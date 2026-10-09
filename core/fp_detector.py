@@ -500,6 +500,29 @@ def _detect_single_finding_fp(
     else:
         line_text = evidence
 
+    # 0. Intent/context classifier (training, example, intentionally vulnerable code)
+    is_training_path = False
+    for path_marker in ("dockerized_labs/", "examples/", "docs/", "training/", "tutorial/"):
+        if path_marker in norm_file:
+            is_training_path = True
+            break
+            
+    has_vulnerable_comment = False
+    if file_lines and f.line:
+        s_idx = max(0, f.line - 5)
+        e_idx = min(len(file_lines), f.line + 3)
+        window = "".join(file_lines[s_idx:e_idx])
+        if re.search(r"#\s*vulnerable:?", window, re.IGNORECASE) or re.search(r"intentionally vulnerable", window, re.IGNORECASE):
+            has_vulnerable_comment = True
+            
+    if is_training_path or has_vulnerable_comment:
+        f.fp_likelihood = "HIGH"
+        f.fp_reason = "Intent classified as training/example code"
+        f.extra["damping_multiplier"] = 0.1
+        f.extra["fp_likelihood"] = f.fp_likelihood
+        f.extra["fp_reason"] = f.fp_reason
+        return
+
     # 1. Test suite mock passwords / secret fixtures
     # Exempt provider-format keys (e.g. AKIA...) and damp only generic passwords
     is_test = is_test_path(f.file) or f.exposure == "TEST"
