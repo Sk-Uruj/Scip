@@ -35,7 +35,15 @@ class Finding:
         d = asdict(self)
         if not include_explanation:
             d.pop('explanation', None)
-        return d
+            
+        clean_d = {}
+        for k, v in d.items():
+            if v in (None, "", [], {}):
+                continue
+            if k in ("blast_radius", "churn", "code_health_penalty", "exploitability") and v in (0, 0.0):
+                continue
+            clean_d[k] = v
+        return clean_d
 
     def clone(self) -> Finding:
         """Return a deep copy of this finding to prevent accidental in-place mutations."""
