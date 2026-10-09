@@ -19,6 +19,8 @@ class Finding:
     # filled later by other stages
     exploitability: float = 0.0      # 0-1 (EPSS / KEV)
     reachable: Optional[bool] = None
+    symbol_reachable: Optional[bool] = None
+    package_imported: Optional[bool] = None
     blast_radius: int = 0
     churn: float = 0.0               # 0-1
     code_health_penalty: float = 0.0 # 0-1
