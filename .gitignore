@@ -14,6 +14,7 @@ __pycache__/
 # --- Generated data (each person regenerates it) ---
 data/*.db
 data/cache/
+data/*_scan.json
 
 # --- Cloned scan targets: every contributor clones their own (see scripts/) ---
 test_repos/*
@@ -31,3 +32,7 @@ Thumbs.db
 *report*.txt
 *.sqlite3
 *.db
+
+
+# --- Remediation outputs ---
+remediation_out/

@@ -356,7 +356,7 @@ def test_test_path_bandit_exec_not_mock_credential():
     assert f.fp_likelihood is None
 
 
-def test_intent_classifier_dockerized_labs(tmp_path):
+def test_intent_classifier_uses_only_declared_training_paths(tmp_path):
     f = Finding(
         engine="bandit",
         title="Hardcoded password",
@@ -366,29 +366,48 @@ def test_intent_classifier_dockerized_labs(tmp_path):
         severity=9.0,
         evidence="conn = connect(password='admin123')",
     )
-    detect_false_positives([f], repo_path=str(tmp_path))
+    detect_false_positives([f], repo_path=str(tmp_path), training_paths=["dockerized_labs"])
     assert f.fp_likelihood == "HIGH"
     assert "Intent classified as training/example code" in f.fp_reason
     assert f.extra.get("damping_multiplier") == 0.1
 
-def test_intent_classifier_vulnerable_comment(tmp_path):
+
+def test_folder_names_alone_never_declare_training_intent(tmp_path):
+    """dockerized_labs/, examples/, docs/ ... used to be hard-coded (the first is pygoat's own folder)."""
+    for name in ("dockerized_labs", "examples", "docs", "training", "tutorial"):
+        f = Finding(engine="bandit", title="Hardcoded password", file=f"{name}/app.py", line=1,
+                    cwe="CWE-259", severity=9.0, evidence="p = 'admin123'")
+        detect_false_positives([f], repo_path=str(tmp_path))
+        assert f.fp_likelihood is None, name
+
+
+def test_training_paths_accept_globs_and_trailing_slashes(tmp_path):
+    for pattern in ("labs/", "labs", "lab*", "*/lab1"):
+        f = Finding(engine="bandit", title="x", file="labs/lab1/app.py", line=1, severity=5.0)
+        detect_false_positives([f], repo_path=str(tmp_path), training_paths=[pattern])
+        assert f.fp_likelihood == "HIGH", pattern
+    other = Finding(engine="bandit", title="x", file="src/app.py", line=1, severity=5.0)
+    detect_false_positives([other], repo_path=str(tmp_path), training_paths=["labs"])
+    assert other.fp_likelihood is None
+
+
+def test_vulnerable_comment_in_scanned_code_is_ignored(tmp_path):
+    """A comment is attacker-controlled: code must not be able to opt itself out of scanning."""
     code = """
 # intentionally vulnerable to SQL injection
 def get_user(uid):
     cursor.execute(f"SELECT * FROM users WHERE id = {uid}")
 """
     (tmp_path / "app.py").write_text(code, encoding="utf-8")
-    
-    f = Finding(
-        engine="bandit",
-        title="SQL injection",
-        file="app.py",
-        line=4,
-        cwe="CWE-89",
-        severity=9.0,
-        evidence='f"SELECT * FROM users WHERE id = {uid}"',
-    )
+    f = Finding(engine="bandit", title="SQL injection", file="app.py", line=4, cwe="CWE-89", severity=9.0,
+                evidence='f"SELECT * FROM users WHERE id = {uid}"')
     detect_false_positives([f], repo_path=str(tmp_path))
-    assert f.fp_likelihood == "HIGH"
-    assert "Intent classified as training/example code" in f.fp_reason
-    assert f.extra.get("damping_multiplier") == 0.1
+    assert f.fp_likelihood is None
+    assert "Intent classified" not in (f.fp_reason or "")
+
+
+def test_declared_training_path_still_cannot_demote_actively_exploited_bugs(tmp_path):
+    f = Finding(engine="dependency", title="CVE", file="labs/requirements.txt", line=1, severity=8.8,
+                extra={"kev": True})
+    detect_false_positives([f], repo_path=str(tmp_path), training_paths=["labs"])
+    assert f.fp_likelihood is None and "fp_blocked" in f.extra

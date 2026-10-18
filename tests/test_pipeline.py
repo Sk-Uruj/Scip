@@ -123,11 +123,25 @@ def test_main_ci_mode_ignores_repo_baseline(tmp_path, monkeypatch):
     assert data_ci[0]["title"] == "Test finding"
     assert data_ci[0]["extra"].get("suppressed") is not True
 
-    # In local mode, repo baseline IS auto-loaded, so finding is suppressed and filtered
+    # Local mode no longer auto-loads it either: a baseline inside the scanned repo is
+    # attacker-controlled input and could hide the repo's own findings.
     code_local = main([str(tmp_path), "--output", str(out_file)])
     assert code_local == 0
     data_local = json.loads(out_file.read_text(encoding="utf-8"))
-    assert len(data_local) == 0
+    assert len(data_local) == 1
+
+    # ...unless the person running SCIP explicitly trusts it
+    code_trust = main([str(tmp_path), "--trust-repo-baseline", "--output", str(out_file)])
+    assert code_trust == 0
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 0
+
+    # CI mode never trusts it, even with the flag
+    main([str(tmp_path), "--ci", "--trust-repo-baseline", "--output", str(out_file)])
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 1
+
+    # An explicit --baseline FILE is always honoured
+    main([str(tmp_path), "--baseline", str(repo_base), "--output", str(out_file)])
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 0
 
 
 def test_main_missing_explicit_baseline_exits_2(tmp_path):
@@ -316,3 +330,79 @@ def vulnerable():
     assert "REACHABLE ATTACK PATHS & REMEDIATION HINTS" in captured.out
     assert "Prod Vulnerability" in captured.out
     assert "Validate input" in captured.out
+
+
+def test_cli_training_path_is_explicit_and_only_then_demotes(tmp_path):
+    import json
+    from core.pipeline import main
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "labs" / "app.py").write_text('DB_PASSWORD = "Tr0ub4dor&3xyz"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+
+    assert main([str(repo), "--engines", "secrets", "--no-history", "--output", str(out)]) == 0
+    plain = json.loads(out.read_text(encoding="utf-8"))
+    assert plain and plain[0].get("fp_likelihood") is None
+
+    assert main([str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs",
+                 "--output", str(out)]) == 0
+    declared = json.loads(out.read_text(encoding="utf-8"))
+    assert declared[0]["fp_likelihood"] == "HIGH"
+    assert declared[0]["risk_score"] < plain[0]["risk_score"]
+
+
+def _two_finding_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "labs" / "demo.py").write_text('DB_PASSWORD = "Tr0ub4dor&3xyz"\n', encoding="utf-8")
+    (repo / "src" / "app.py").write_text('API_PASSWORD = "Zq8x2Lm9Pw4Rt7Yb"\n', encoding="utf-8")
+    return repo
+
+
+def test_json_output_includes_the_score_explanation(tmp_path):
+    import json
+    from core.pipeline import main
+    repo = _two_finding_repo(tmp_path)
+    out = tmp_path / "out.json"
+    main([str(repo), "--engines", "secrets", "--no-history", "--output", str(out)])
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data and all(x.get("explanation") for x in data)
+    assert "risk" in data[0]["explanation"].lower() or "score" in data[0]["explanation"].lower()
+
+
+def test_hide_fp_is_opt_in_accounted_for_and_recoverable(tmp_path, capsys):
+    import json
+    from core.pipeline import main
+    repo = _two_finding_repo(tmp_path)
+    out = tmp_path / "out.json"
+    base = [str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs", "--output", str(out)]
+
+    # default: nothing is hidden, the demoted finding is still reported
+    main(base)
+    assert len(json.loads(out.read_text(encoding="utf-8"))) == 2
+
+    # --hide-fp: hidden from the report, but counted, explained, and saved to a sidecar file
+    capsys.readouterr()
+    main(base + ["--hide-fp"])
+    err = capsys.readouterr().err
+    visible = json.loads(out.read_text(encoding="utf-8"))
+    assert [x["file"] for x in visible] == ["src/app.py"]
+    assert "hid 1 likely false positive" in err and "training/example" in err
+    sidecar = tmp_path / "out.hidden-fp.json"
+    hidden = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert [x["file"] for x in hidden] == ["labs/demo.py"]
+
+
+def test_hide_fp_never_hides_protected_findings(tmp_path):
+    """A KEV-listed bug or provider-format token inside a declared training path stays visible."""
+    import json
+    from core.pipeline import main
+    from tests import fake_secrets as fs
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "labs" / "keys.py").write_text(f'GH = "{fs.github_token()}"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+    main([str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs", "--hide-fp",
+          "--output", str(out)])
+    assert len(json.loads(out.read_text(encoding="utf-8"))) == 1

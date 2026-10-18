@@ -1,0 +1,159 @@
+# SCIP evaluation labels for: vulpy
+# Set `verdict` to  TP (real vulnerability) | FP (false alarm) | UNSURE  - leave "" to skip.
+# Use `note` to record WHY (this is what you explain in the viva). Re-running `template` keeps your work.
+repo: "vulpy"
+findings:
+  # ===== DRAFT labels written by Claude from reading the code - the team must verify each one =====
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 9 10 r = requests.get('http://127.0.1.1:5000/api/post/{}'.format(username)) 11 if r.status_code !...
+  "bad/api_list.py:10:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 5 6 api_key_file = Path('/tmp/supersecret.txt') 7
+  "bad/api_post.py:6:CWE-377": {verdict: "TP", note: "API key is stored in the fixed file /tmp/supersecret.txt. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 15 16 r = requests.post('http://127.0.1.1:5000/api/key', json={'username':username, 'password':pa...
+  "bad/api_post.py:16:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code."}
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 29 api_key = api_key_file.open().read() 30 r = requests.post('http://127.0.1.1:5000/api/post', js...
+  "bad/api_post.py:30:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: c.execute("INSERT INTO users (user, password, failures) VALUES ('%s', '%s', '%d')" %(u, p, 0))
+  "bad/db.py:19:CWE-89": {verdict: "FP", note: "Formatted SQL, but the values come from a hard-coded seed list in the same function: no attacker-controlled input reaches it."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: c.execute("INSERT INTO users (username, password, failures, mfa_enabled, mfa_secret) VALUES ('%s'...
+  "bad/db_init.py:20:CWE-89": {verdict: "FP", note: "Formatted SQL, but the values come from a hard-coded seed list in the same function: no attacker-controlled input reaches it."}
+  # [bandit] Bandit B311: Standard pseudo-random generators are not suitable for security/cryptograp...
+  #   evidence: 13 14 key = hashlib.sha256(str(random.getrandbits(2048)).encode()).hexdigest() 15
+  "bad/libapi.py:14:CWE-330": {verdict: "TP", note: "API key built from random.getrandbits(), which is not cryptographically secure (secrets module should be used)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 15 16 for f in Path('/tmp/').glob('vulpy.apikey.' + username + '.*'): 17 print('removing', f)
+  "bad/libapi.py:16:CWE-377": {verdict: "TP", note: "API key files live in /tmp. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 19 20 keyfile = '/tmp/vulpy.apikey.{}.{}'.format(username, key) 21
+  "bad/libapi.py:20:CWE-377": {verdict: "TP", note: "API key file path built in /tmp. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 32 33 for f in Path('/tmp/').glob('vulpy.apikey.*.' + key): 34 return f.name.split('.')[2]
+  "bad/libapi.py:33:CWE-377": {verdict: "TP", note: "API key files looked up in /tmp. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: user = c.execute("SELECT * FROM users WHERE username = '{}' and password = '{}'".format(username,...
+  "bad/libuser.py:12:CWE-89": {verdict: "TP", note: "User-supplied value is formatted straight into the SQL string (real SQL injection). Login query built with str.format()."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: c.execute("INSERT INTO users (username, password, failures, mfa_enabled, mfa_secret) VALUES ('%s'...
+  "bad/libuser.py:25:CWE-89": {verdict: "TP", note: "User-supplied value is formatted straight into the SQL string (real SQL injection). INSERT built with % formatting."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: c.execute("UPDATE users SET password = '{}' WHERE username = '{}'".format(password, username))
+  "bad/libuser.py:53:CWE-89": {verdict: "TP", note: "User-supplied value is formatted straight into the SQL string (real SQL injection). UPDATE built with str.format()."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 28 29 app.run(debug=True, host='127.0.1.1', ssl_context=('/tmp/acme.cert', '/tmp/acme.key'))
+  "bad/vulpy-ssl.py:29:CWE-377": {verdict: "TP", note: "TLS cert and private key are read from /tmp/acme.*. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B201: A Flask app appears to be run with debug=True, which exposes the Werkzeug ...
+  #   evidence: 28 29 app.run(debug=True, host='127.0.1.1', ssl_context=('/tmp/acme.cert', '/tmp/acme.key'))
+  "bad/vulpy-ssl.py:29:CWE-489": {verdict: "TP", note: "app.run(debug=True) exposes the Werkzeug debugger (remote code execution risk)."}
+  # [bandit] Bandit B105: Possible hardcoded password: '********'
+  #   evidence: 15 app = Flask('********') 16 app.config['********'] = '********' 17
+  "bad/vulpy.py:16:CWE-259": {verdict: "TP", note: "Flask SECRET_KEY hard-coded as 'aaaaaaa'. The tool calls it a password, but it is a real hard-coded secret."}
+  # [bandit] Bandit B201: A Flask app appears to be run with debug=True, which exposes the Werkzeug ...
+  #   evidence: 54 55 app.run(debug=True, host='127.0.1.1', port=5000, extra_files='csp.txt')
+  "bad/vulpy.py:55:CWE-489": {verdict: "TP", note: "app.run(debug=True) exposes the Werkzeug debugger."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 2 3 with open('********.txt') as f: 4 for password in f.readlines():
+  "good/cutpasswd.py:3:CWE-377": {verdict: "UNSURE", note: "Reads a public wordlist from /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 21 for password in passwords: 22 response = requests.post(URL, data = {'username': username, 'pas...
+  "good/httpbrute.py:22:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code."}
+  # [semgrep] Semgrep formatted-query: SQL query constructed with string formatting or f-strings
+  #   evidence: c.execute("INSERT INTO users (username, password, salt, failures, mfa_enabled, mfa_secret) VALUES...
+  "good/libuser.py:61:CWE-89": {verdict: "FP", note: "user_create() formats username into SQL, but its only caller is good/db_init.py with a hard-coded seed list. Not reachable with attacker input today."}
+  # [bandit] Bandit B105: Possible hardcoded password: '********'
+  #   evidence: 12 app = Flask('********') 13 app.config['********'] = '********' 14
+  "good/vulpy-ssl.py:13:CWE-259": {verdict: "TP", note: "Flask SECRET_KEY hard-coded as 'aaaaaaa'."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 28 29 app.run(debug=True, host='127.0.1.1', ssl_context=('/tmp/acme.cert', '/tmp/acme.key'))
+  "good/vulpy-ssl.py:29:CWE-377": {verdict: "TP", note: "TLS cert and private key are read from /tmp/acme.*. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B201: A Flask app appears to be run with debug=True, which exposes the Werkzeug ...
+  #   evidence: 28 29 app.run(debug=True, host='127.0.1.1', ssl_context=('/tmp/acme.cert', '/tmp/acme.key'))
+  "good/vulpy-ssl.py:29:CWE-489": {verdict: "TP", note: "app.run(debug=True) is still enabled in the 'good' version."}
+  # [bandit] Bandit B201: A Flask app appears to be run with debug=True, which exposes the Werkzeug ...
+  #   evidence: 52 53 app.run(debug=True, host='127.0.1.1', port=5001, extra_files='csp.txt') 54
+  "good/vulpy.py:53:CWE-489": {verdict: "TP", note: "app.run(debug=True) is still enabled in the 'good' version."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 30 31 with open('/tmp/ca.key', 'wb') as out: 32 out.write(pem_private)
+  "utils/ca-create.py:31:CWE-377": {verdict: "TP", note: "Writes the CA private key to /tmp/ca.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 33 34 with open('/tmp/ca.pub', 'wb') as out: 35 out.write(pem_public)
+  "utils/ca-create.py:34:CWE-377": {verdict: "UNSURE", note: "Writes a public key to /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 57 # Write our certificate out to disk. 58 with open('/tmp/ca.cert', 'wb') as out: 59 out.write(c...
+  "utils/ca-create.py:58:CWE-377": {verdict: "UNSURE", note: "Writes a public certificate to /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 11 12 with open("/tmp/acme.key", "rb") as key_file: 13 private_key = serialization.load_pem_priva...
+  "utils/ca-csr-create.py:12:CWE-377": {verdict: "TP", note: "Reads the private key /tmp/acme.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 34 # Write our CSR out to disk. 35 with open("/tmp/acme.csr", "wb") as out: 36 out.write(csr.publ...
+  "utils/ca-csr-create.py:35:CWE-377": {verdict: "UNSURE", note: "Writes a certificate signing request (public data) to /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 12 13 with open("/tmp/ca.cert", "rb") as ca_cert_file: 14 ca_cert = x509.********(ca_cert_file.re...
+  "utils/ca-csr-load.py:13:CWE-377": {verdict: "UNSURE", note: "Reads a public CA certificate from /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 15 16 with open("/tmp/acme.csr", "rb") as csr_file: 17 csr = x509.load_pem_x509_csr(csr_file.read...
+  "utils/ca-csr-load.py:16:CWE-377": {verdict: "UNSURE", note: "Reads a certificate signing request (public data) from /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 18 19 with open("/tmp/ca.key", "rb") as key_file: 20 private_key = serialization.load_pem_private...
+  "utils/ca-csr-load.py:19:CWE-377": {verdict: "TP", note: "Reads the CA private key /tmp/ca.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 34 # Write our certificate out to disk. 35 with open('/tmp/acme.cert', 'wb') as out: 36 out.write...
+  "utils/ca-csr-load.py:35:CWE-377": {verdict: "UNSURE", note: "Writes a signed certificate (public data) to /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 20 click.echo('Downloading password file...', nl=False, err=True) 21 with requests.get(url, strea...
+  "utils/generate_bad_passwords.py:21:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code. It downloads a file with requests.get(url, stream=True)."}
+  # [bandit] Bandit B113: Call to requests without timeout
+  #   evidence: 24 for password in passwords: 25 response = requests.post(url, data = {'username': username, 'pas...
+  "utils/httpbrute.py:25:CWE-400": {verdict: "TP", note: "requests call has no timeout, so the script can hang forever. The rule's claim is true for this code."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 13 14 with open("/tmp/acme.key", "rb") as key_file: 15 private_key = serialization.load_pem_priva...
+  "utils/rsa-decrypt.py:14:CWE-377": {verdict: "TP", note: "Reads the private key /tmp/acme.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 13 14 with open("/tmp/acme.pub", "rb") as key_file: 15 public_key = serialization.load_pem_public...
+  "utils/rsa-encrypt.py:14:CWE-377": {verdict: "UNSURE", note: "Reads a public key from /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 25 26 with open('/tmp/acme.key', 'wb') as out: 27 out.write(pem_private)
+  "utils/rsa-keygen.py:26:CWE-377": {verdict: "TP", note: "Writes the private key to /tmp/acme.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 28 29 with open('/tmp/acme.pub', 'wb') as out: 30 out.write(pem_public)
+  "utils/rsa-keygen.py:29:CWE-377": {verdict: "UNSURE", note: "Writes a public key to /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 14 15 with open("/tmp/acme.key", "rb") as key_file: 16 private_key = serialization.load_pem_priva...
+  "utils/rsa-sign.py:15:CWE-377": {verdict: "TP", note: "Reads the private key /tmp/acme.key. Hard-coded /tmp path holds a private key / secret (other local users can read or replace it)."}
+  # [bandit] Bandit B108: Probable insecure usage of temp file/directory.
+  #   evidence: 15 16 with open("/tmp/acme.pub", "rb") as key_file: 17 public_key = serialization.load_pem_public...
+  "utils/rsa-verify.py:16:CWE-377": {verdict: "UNSURE", note: "Reads a public key from /tmp. Hard-coded /tmp path, but it only holds public data (cert / public key / wordlist): low impact, team decides."}
+  # [bandit] Bandit B311: Standard pseudo-random generators are not suitable for security/cryptograp...
+  #   evidence: 8 #key = secrets.token_bytes(2048) # needs python 3.6 9 key = str(random.getrandbits(2048)).encod...
+  "utils/skey.py:9:CWE-330": {verdict: "TP", note: "Secret key built from random.getrandbits() (not cryptographically secure)."}
+  # ===== already labelled =====
+  # [crypto] Cleartext HTTP URL used in network transmission
+  #   evidence: r = requests.post('http://127.0.1.1:5000/api/key', json={'username':username, 'password':password})
+  "bad/api_post.py:16:CWE-319": {verdict: "UNSURE", note: "Password sent over http:// but only to the 127.0.1.1 local dev server. Team to decide."}
+  # [crypto] Cleartext HTTP URL used in network transmission
+  #   evidence: r = requests.post('http://127.0.1.1:5000/api/post', json={'text':message}, headers={'X-APIKEY': a...
+  "bad/api_post.py:30:CWE-319": {verdict: "UNSURE", note: "API key sent over http:// to the 127.0.1.1 local dev server. Team to decide."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: app.config['SECRET_KEY'] = '********'
+  "bad/vulpy-ssl.py:13:CWE-798": {verdict: "TP", note: "SECRET_KEY = 'aaaaaaa': hard-coded and trivially guessable."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: secret = '********'
+  "good/libapi.py:10:CWE-798": {verdict: "TP", note: "API signing secret 'MYSUPERSECRETKEY' hard-coded in source."}
+  # [secrets] Hard-coded secret: High-entropy string (possible secret)
+  #   evidence: key = '********'
+  "good/libsession.py:9:CWE-798": {verdict: "TP", note: "Fernet encryption key hard-coded in source."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: app.config['SECRET_KEY'] = '********'
+  "good/vulpy.py:17:CWE-798": {verdict: "TP", note: "Flask SECRET_KEY hard-coded in source. Still real even in vulpy's 'good' (fixed) version."}
+expected:
+  - {"file": "bad/libuser.py", "line": 12, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: login query built with str.format()"}
+  - {"file": "bad/libuser.py", "line": 25, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: INSERT built with % formatting"}
+  - {"file": "bad/libuser.py", "line": 53, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: UPDATE built with str.format()"}
+  - {"file": "bad/vulpy.py", "line": 55, "tol": 2, "cwe": ["CWE-489", "CWE-94"], "note": "app.run(debug=True) exposes the Werkzeug debugger"}
+  - {"file": "bad/vulpy-ssl.py", "line": 29, "tol": 2, "cwe": ["CWE-489", "CWE-94"], "note": "app.run(debug=True) exposes the Werkzeug debugger"}
+  - {"file": "bad/vulpy-ssl.py", "line": 13, "tol": 2, "cwe": "CWE-798", "note": "hard-coded SECRET_KEY 'aaaaaaa'"}
+  - {"file": "bad/libapi.py", "line": 14, "tol": 2, "cwe": "CWE-330", "note": "API key derived from non-cryptographic random.getrandbits"}

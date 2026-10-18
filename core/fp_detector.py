@@ -11,18 +11,22 @@ safe-by-design or protocol-mandated, such as:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import hashlib
 import logging
 import os
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from core.finding import Finding
 from core.risk_graph import is_test_path
+from engines.secrets_engine import PROVIDER_RULES
 from engines.blast_radius_engine import find_enclosing_function
 
 log = logging.getLogger("scip.fp_detector")
+
+_PROVIDER_RULE_IDS = {r.id for r in PROVIDER_RULES if r.id not in ("jwt", "db-url-password")}
 
 ETAG_PATTERNS = [
     re.compile(r"\betag\b", re.IGNORECASE),
@@ -399,9 +403,104 @@ def is_provider_format_secret(f: Finding, line_text: str = "") -> bool:
     return False
 
 
+
+# --------------------------------------------------------------------------- #
+# Guard: a weak hash of SENSITIVE data is never an "ETag false positive"
+# --------------------------------------------------------------------------- #
+_SENSITIVE_WORDS = {
+    "password", "passwd", "pwd", "passphrase", "passcode", "pass", "secret", "token", "credential",
+    "credentials", "otp", "session", "auth", "authorization", "ssn", "pin",
+}
+_SENSITIVE_COMPOUNDS = re.compile(
+    r"(apikey|privatekey|secretkey|accesskey|authkey|signingkey|encryptionkey|sessionid)")
+
+
+def _identifier_words(name: str) -> List[str]:
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name)
+    return [w for w in re.split(r"[_\W]+", spaced.lower()) if w]
+
+
+def _is_sensitive_identifier(name: str) -> bool:
+    if not name:
+        return False
+    words = _identifier_words(name)
+    if any(w in _SENSITIVE_WORDS for w in words):
+        return True
+    return bool(_SENSITIVE_COMPOUNDS.search("".join(words)))
+
+
+def _names_in(node: ast.AST) -> set:
+    names = set()
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name):
+            names.add(n.id)
+        elif isinstance(n, ast.Attribute):
+            names.add(n.attr)
+    return names
+
+
+def _hashed_data_is_sensitive(file_lines: List[str], line_no: Optional[int], evidence: str) -> bool:
+    """True when anything flowing into the hash call on ``line_no`` is credential-like.
+
+    Looks at (1) the identifiers inside the call, (2) the enclosing function's name and
+    parameters, and (3) one level of taint: ``data = user.password.encode()`` makes ``data``
+    sensitive. Falls back to a text check of the evidence when the file cannot be parsed.
+    """
+    fallback = any(_is_sensitive_identifier(tok) for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", evidence or ""))
+    if not file_lines or not line_no:
+        return fallback
+    try:
+        tree = ast.parse("".join(file_lines))
+    except (SyntaxError, ValueError):
+        return fallback
+
+    funcs = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and n.lineno <= line_no <= (getattr(n, "end_lineno", n.lineno) or n.lineno)]
+    func = min(funcs, key=lambda n: (getattr(n, "end_lineno", n.lineno) - n.lineno), default=None)
+
+    tainted: set = set()
+    scope = func if func is not None else tree
+    if func is not None:
+        tainted.add(func.name)
+        tainted.update(a.arg for a in func.args.args + func.args.kwonlyargs + func.args.posonlyargs)
+    sensitive_names = {n for n in tainted if _is_sensitive_identifier(n)}
+    for _ in range(2):                                   # propagate through assignments
+        for node in ast.walk(scope):
+            if isinstance(node, ast.Assign):
+                rhs = _names_in(node.value)
+                if any(_is_sensitive_identifier(n) or n in sensitive_names for n in rhs):
+                    for t in node.targets:
+                        sensitive_names.update(_names_in(t))
+
+    call_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and node.lineno <= line_no <= (getattr(node, "end_lineno", node.lineno) or node.lineno):
+            for arg in list(node.args) + [k.value for k in node.keywords]:
+                call_names |= _names_in(arg)
+    names = call_names | sensitive_names
+    if any(_is_sensitive_identifier(n) for n in names) or (sensitive_names & call_names):
+        return True
+    # a hash call whose argument we could not name (e.g. md5(get_input())): judge by the function context
+    return bool(func is not None and _is_sensitive_identifier(func.name))
+
+
+def _matches_training_path(norm_file: str, training_paths: Sequence[str]) -> bool:
+    """True if the file lies under (or matches) a path the user declared as training material."""
+    path = norm_file.strip("/")
+    for raw in training_paths or ():
+        pat = (raw or "").replace("\\", "/").strip().strip("/")
+        if not pat:
+            continue
+        if path == pat or path.startswith(pat + "/") or fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(path, pat + "/*"):
+            return True
+    return False
+
+
 def _detect_single_finding_fp(
     f: Finding,
-    repo_path: Optional[str]
+    repo_path: Optional[str],
+    training_paths: Sequence[str] = (),
 ) -> None:
     """Evaluate a single finding for false-positive indicators."""
     evidence = f.evidence or ""
@@ -431,24 +530,12 @@ def _detect_single_finding_fp(
     else:
         line_text = evidence
 
-    # 0. Intent/context classifier (training, example, intentionally vulnerable code)
-    is_training_path = False
-    for path_marker in ("dockerized_labs/", "examples/", "docs/", "training/", "tutorial/"):
-        if path_marker in norm_file:
-            is_training_path = True
-            break
-            
-    has_vulnerable_comment = False
-    if file_lines and f.line:
-        s_idx = max(0, f.line - 5)
-        e_idx = min(len(file_lines), f.line + 3)
-        window = "".join(file_lines[s_idx:e_idx])
-        if re.search(r"#\s*vulnerable:?", window, re.IGNORECASE) or re.search(r"intentionally vulnerable", window, re.IGNORECASE):
-            has_vulnerable_comment = True
-            
-    if is_training_path or has_vulnerable_comment:
+    # 0. Intent classifier: code the PERSON RUNNING SCIP declared to be training / example material
+    #    (--training-path). Never inferred from the scanned repo: folder names and comments such as
+    #    "intentionally vulnerable" are attacker-controlled and would let any code opt itself out.
+    if _matches_training_path(norm_file, training_paths):
         f.fp_likelihood = "HIGH"
-        f.fp_reason = "Intent classified as training/example code"
+        f.fp_reason = "Intent classified as training/example code (declared with --training-path)"
         f.extra["damping_multiplier"] = 0.1
         f.extra["fp_likelihood"] = f.fp_likelihood
         f.extra["fp_reason"] = f.fp_reason
@@ -489,7 +576,13 @@ def _detect_single_finding_fp(
         matches_etag_code = any(p.search(nearby_lines) for p in ETAG_PATTERNS) or any(p.search(evidence) for p in ETAG_PATTERNS)
         matches_etag_text = any(p.search(f.description or "") for p in ETAG_PATTERNS) or any(p.search(f.title or "") for p in ETAG_PATTERNS)
 
-        if matches_etag_func or matches_etag_code or matches_etag_text:
+        etag_signal = matches_etag_func or matches_etag_code or matches_etag_text
+        if etag_signal and _hashed_data_is_sensitive(file_lines, f.line, evidence):
+            # Words like "etag" in a comment or name are NOT evidence when the hashed value is a
+            # password/secret/token. Keep the finding and say why.
+            f.extra["fp_guard"] = "weak hash of credential-like data: not treated as an ETag checksum"
+            etag_signal = False
+        if etag_signal:
             f.fp_likelihood = "HIGH"
             f.fp_reason = "RFC 7232 AWS S3 ETag compliance (non-cryptographic checksum)"
             f.extra["fp_likelihood"] = f.fp_likelihood
@@ -532,14 +625,41 @@ def _detect_single_finding_fp(
             f.fix_hint = "For transaction reference IDs, standard PRNG may be acceptable, but use secrets.choice or uuid4 to prevent reference enumeration/prediction."
 
 
-def detect_false_positives(findings: List[Finding], repo_path: Optional[str] = None) -> List[Finding]:
-    """Inspect findings and tag high-confidence false positive and seed patterns."""
+def _protected_reason(f: Finding) -> Optional[str]:
+    """Findings that must never be labelled a false positive, whichever rule fired."""
+    extra = f.extra or {}
+    if extra.get("kev"):
+        return "actively exploited (CISA KEV)"
+    if f.engine == "secrets" and extra.get("rule") in _PROVIDER_RULE_IDS:
+        return "provider-format credential"
+    return None
+
+
+def _clear_fp(f: Finding, why: str) -> None:
+    f.fp_likelihood = None
+    f.fp_reason = None
+    for key in ("fp_likelihood", "fp_reason", "damping_multiplier"):
+        f.extra.pop(key, None)
+    f.extra["fp_blocked"] = f"not demoted: {why}"
+
+
+def detect_false_positives(findings: List[Finding], repo_path: Optional[str] = None,
+                           training_paths: Sequence[str] = ()) -> List[Finding]:
+    """Inspect findings and tag high-confidence false positive and seed patterns.
+
+    ``training_paths``: paths the caller declared as training/example code (see --training-path)."""
     for f in findings:
         try:
-            _detect_single_finding_fp(f, repo_path)
+            _detect_single_finding_fp(f, repo_path, training_paths)
         except Exception as exc:
             loc = f"{getattr(f, 'file', '')}:{getattr(f, 'line', '')}"
             log.warning("False-positive evaluation failed for finding '%s' at %s: %s", getattr(f, "title", "finding"), loc, exc)
             continue
+
+    # Safety rail: no rule (including ones that ran earlier, e.g. in the risk graph) may demote these.
+    for f in findings:
+        why = _protected_reason(f)
+        if why and (getattr(f, "fp_likelihood", None) or f.extra.get("fp_likelihood")):
+            _clear_fp(f, why)
 
     return findings

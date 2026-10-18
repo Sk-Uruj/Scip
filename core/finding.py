@@ -31,7 +31,7 @@ class Finding:
     fp_reason: Optional[str] = None
     extra: dict = field(default_factory=dict)
 
-    def to_dict(self, include_explanation: bool = False) -> dict:
+    def to_dict(self, include_explanation: bool = True) -> dict:
         d = asdict(self)
         if not include_explanation:
             d.pop('explanation', None)

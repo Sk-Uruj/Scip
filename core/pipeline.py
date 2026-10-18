@@ -17,6 +17,7 @@ from typing import List, Optional, Set
 
 from core.dedup import deduplicate_findings
 from core.finding import Finding
+from core.redact import redact_finding
 from core.suppression import filter_suppressions, save_baseline
 from engines.bandit_engine import BanditEngine
 from engines.dependency_engine import DependencyEngine
@@ -72,6 +73,10 @@ def run_scan(
     is_ci: bool = False,
     scoring: bool = True,
     exclude_tests: bool = False,
+    trust_repo_baseline: bool = False,
+    training_paths: Optional[List[str]] = None,
+    hide_fp: bool = False,
+    hidden_fp_out: Optional[List[Finding]] = None,
 ) -> List[Finding]:
     engines = engines if engines is not None else get_engines(include_suppressed=include_suppressed)
     findings: List[Finding] = []
@@ -89,16 +94,20 @@ def run_scan(
         print(f"[+] Running {engine.name} engine...", file=sys.stderr)
         findings.extend(engine.scan(repo_path))
 
-    # Auto-detect baseline file in repository root if not specified
+    # A baseline stored INSIDE the scanned repository is attacker-controlled input: a repo can ship
+    # a baseline that silently hides its own findings. It is therefore ignored unless the person
+    # running SCIP explicitly trusts it (--trust-repo-baseline) or points to a file (--baseline).
     if not baseline_path:
         default_baseline = Path(repo_path).resolve() / ".scip-baseline.json"
         if default_baseline.exists():
-            if is_ci:
-                print(f"[!] CI mode: skipping auto-detection of {default_baseline}. "
-                      f"Pass --baseline explicitly to enforce a baseline.", file=sys.stderr)
-            else:
+            if trust_repo_baseline and not is_ci:
                 baseline_path = str(default_baseline)
-                print(f"[!] Auto-loading repository baseline: {default_baseline}", file=sys.stderr)
+                print(f"[!] Using repository baseline (trusted by --trust-repo-baseline): {default_baseline}",
+                      file=sys.stderr)
+            else:
+                print(f"[!] Ignoring {default_baseline}: a baseline inside the scanned repo can hide findings. "
+                      f"Pass --baseline FILE to use one, or --trust-repo-baseline if you trust this repo.",
+                      file=sys.stderr)
 
     # 1. Apply inline and baseline suppressions per-source before deduplication
     active, suppressed = filter_suppressions(
@@ -120,7 +129,7 @@ def run_scan(
 
     # 3. Calculate 0-100 risk score and sort by risk_score descending (or legacy sort if disabled)
     if scoring:
-        active = score_and_sort_findings(active, repo_path=repo_path)
+        active = score_and_sort_findings(active, repo_path=repo_path, training_paths=training_paths)
     else:
         active = sorted(active, key=lambda f: (-f.severity, -f.exploitability))
 
@@ -133,6 +142,23 @@ def run_scan(
         if test_filtered > 0:
             print(f"[+] Excluded {test_filtered} test fixture finding(s)", file=sys.stderr)
 
+    # 5. Optional: hide HIGH-likelihood false positives. Opt-in, never silent, always recoverable:
+    #    the count and reasons are printed and the hidden findings are handed back to the caller.
+    if hide_fp and active:
+        hidden = [f for f in active if f.fp_likelihood == "HIGH"]
+        if hidden:
+            active = [f for f in active if f.fp_likelihood != "HIGH"]
+            if hidden_fp_out is not None:
+                hidden_fp_out.extend(hidden)
+            from collections import Counter
+            print(f"[!] --hide-fp: hid {len(hidden)} likely false positive(s). Re-run without --hide-fp to see them.",
+                  file=sys.stderr)
+            for reason, n in Counter((f.fp_reason or "unspecified")[:90] for f in hidden).most_common(5):
+                print(f"      {n:>3} x {reason}", file=sys.stderr)
+
+    # Safety net: no engine may ever put a credential value into the report (idempotent).
+    for f in active:
+        redact_finding(f)
     return active
 
 
@@ -242,6 +268,17 @@ def main(argv=None) -> int:
                     help="custom Semgrep rules file, directory, or preset (e.g., p/python)")
     ap.add_argument("--engines", metavar="LIST",
                     help="comma-separated list of engines to run (e.g. dependency,secrets,bandit,semgrep)")
+    ap.add_argument("--hide-fp", action="store_true",
+                    help="hide findings labelled HIGH likelihood false positive (off by default). The count and "
+                         "reasons are printed and, with --output, the hidden findings are saved to "
+                         "<output>.hidden-fp.json so nothing is lost")
+    ap.add_argument("--training-path", action="append", default=[], metavar="PATH",
+                    help="declare a folder/glob as training or example code (repeatable), e.g. "
+                         "--training-path dockerized_labs. Findings there are strongly demoted. "
+                         "This is never inferred from the scanned repo.")
+    ap.add_argument("--trust-repo-baseline", action="store_true",
+                    help="also use a .scip-baseline.json found inside the scanned repo (off by default: "
+                         "a scanned repo could use it to hide its own findings)")
     ap.add_argument("--ci", action="store_true",
                     help="run in CI mode: require explicit --baseline and do not auto-load repo baseline")
     ap.add_argument("--strict", action="store_true",
@@ -308,6 +345,7 @@ def main(argv=None) -> int:
         print(f"[+] Wrote {saved_count} unfiltered findings to baseline {args.make_baseline}", file=sys.stderr)
         return 0
 
+    hidden_fp: List[Finding] = []
     try:
         findings = run_scan(
             args.path,
@@ -318,6 +356,10 @@ def main(argv=None) -> int:
             is_ci=is_ci,
             scoring=not args.no_scoring,
             exclude_tests=args.exclude_tests,
+            trust_repo_baseline=args.trust_repo_baseline,
+            training_paths=args.training_path,
+            hide_fp=args.hide_fp,
+            hidden_fp_out=hidden_fp,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -337,6 +379,11 @@ def main(argv=None) -> int:
         with open(args.output, "w", encoding="utf-8", newline="\n") as fh:
             json.dump([f.to_dict() for f in findings], fh, indent=2)
         print(f"[+] Wrote {len(findings)} findings to {args.output} (UTF-8)", file=sys.stderr)
+        if hidden_fp:
+            sidecar = Path(args.output).with_suffix("").as_posix() + ".hidden-fp.json"
+            with open(sidecar, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump([f.to_dict() for f in hidden_fp], fh, indent=2)
+            print(f"[+] Wrote the {len(hidden_fp)} hidden false positive(s) to {sidecar}", file=sys.stderr)
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
         for e in engines:

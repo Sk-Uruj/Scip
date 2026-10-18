@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 
 import networkx as nx
 
+from core.pkg_alias import import_names, import_names_known, normalize_dist, parents_of
+
 from core.finding import Finding
 from core.graph_store import SQLiteGraphStore
 from engines.blast_radius_engine import find_enclosing_function
@@ -78,6 +80,7 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
         self.module_node_id = f"module::{self.file_path}"
         self.current_class: Optional[str] = None
         self.current_function: Optional[str] = None
+        self.in_management_command = False
 
         self.local_functions: Set[str] = set()
         self.local_classes: Set[str] = set()
@@ -92,6 +95,13 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 self.local_functions.add(node.name)
             elif isinstance(node, ast.ClassDef):
                 self.local_classes.add(node.name)
+            elif (isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Tuple))
+                  and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)):
+                # __all__ = ["hash_password", ...]  -> public API of this module
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        self.graph.add_edge(self.module_node_id, f"{self.file_path}::{elt.value}",
+                                            kind="EXPORTS", exported=True, confidence="heuristic")
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     pkg_or_mod = alias.name
@@ -127,6 +137,10 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 for alias in node.names:
                     local_symbol = alias.asname or alias.name
                     self.imported_symbols[local_symbol] = (mod, alias.name)
+                    if self.file_path.endswith("__init__.py") and mod in self.module_to_file:
+                        # `from .auth import hash_password` inside a package __init__ = public re-export
+                        self.graph.add_edge(self.module_node_id, f"{self.module_to_file[mod]}::{alias.name}",
+                                            kind="EXPORTS", exported=True, confidence="heuristic")
                     sub_mod = f"{mod}.{alias.name}" if mod else alias.name
                     self.imported_modules[local_symbol] = sub_mod
                     
@@ -160,7 +174,13 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 is_test=self.is_test,
             )
 
+        # Django management commands: `class Command(BaseCommand): def handle(...)` is run by `manage.py`
+        prev_cmd = self.in_management_command
+        self.in_management_command = any(
+            str(getattr(b, "id", None) or getattr(b, "attr", None) or "").endswith("BaseCommand") for b in node.bases)
+
         self.generic_visit(node)
+        self.in_management_command = prev_cmd
         self.current_class = prev_class
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -231,9 +251,15 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             elif "click.command" in dec_lower or "app.command" in dec_lower:
                 entrypoint_type = "cli"
                 break
-            elif "celery.task" in dec_lower or "shared_task" in dec_lower:
+            elif "celery.task" in dec_lower or "shared_task" in dec_lower or dec_lower.endswith(".task"):
                 entrypoint_type = "worker"
                 break
+            elif dec_lower == "receiver" or dec_lower.endswith(".receiver"):
+                entrypoint_type = "worker"          # Django signal handler: invoked by the framework
+                break
+
+        if not entrypoint_type and self.in_management_command and getattr(node, "name", "") in ("handle", "handle_noargs"):
+            entrypoint_type = "cli"
 
         # Also detect Django function view (def foo(request, ...)) in views.py
         if not entrypoint_type and "views" in self.file_path.lower():
@@ -302,6 +328,32 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     if kw_callee:
                         edge_attrs = {"kind": "CALLS", "resolution": res_method, "confidence": "heuristic" if is_h else "exact"}
                         self.graph.add_edge(self.current_function, kw_callee, **edge_attrs)
+        self.generic_visit(node)
+
+    def _add_reference(self, node: ast.AST):
+        """`HANDLERS = {"md5": h_md5}`, `register(callback)`: using a function as a value is evidence
+        that it is used, even though no direct call is visible."""
+        callee_id, is_heuristic, how = self._resolve_callee(node)
+        if not callee_id or callee_id.startswith("pkg::"):
+            return
+        src = self.current_function or self.module_node_id
+        if src == callee_id:
+            return
+        if self.graph.has_edge(src, callee_id):
+            # networkx keeps ONE edge per node pair (e.g. module -CONTAINS-> function): flag it
+            self.graph.edges[src, callee_id]["referenced"] = True
+        else:
+            self.graph.add_edge(src, callee_id, kind="REFERENCES", referenced=True,
+                                resolution=how, confidence="heuristic")
+
+    def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, ast.Load):
+            self._add_reference(node)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        if isinstance(node.ctx, ast.Load):
+            self._add_reference(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
@@ -501,6 +553,34 @@ class RiskGraph:
 
         return self
 
+    def _dependency_nodes(self, dist: str):
+        """Graph nodes that represent this dependency, and the parent it was reached through.
+
+        Direct: the package is imported under one of its import names (PyYAML -> ``yaml``).
+        Transitive: it is not imported, but a package that depends on it is (sqlparse <- Django), so it
+        inherits that package's exposure. Returns ``([], None)`` when nothing matches.
+        """
+        def direct(d: str):
+            return [f"pkg::{n}" for n in import_names(d) if self.graph.has_node(f"pkg::{n}")]
+
+        nodes = direct(dist)
+        if nodes:
+            return nodes, None
+        seen, frontier = {normalize_dist(dist)}, [dist]
+        for _ in range(3):
+            upcoming = []
+            for d in frontier:
+                for parent in parents_of(d):
+                    if normalize_dist(parent) in seen:
+                        continue
+                    seen.add(normalize_dist(parent))
+                    nodes = direct(parent)
+                    if nodes:
+                        return nodes, parent
+                    upcoming.append(parent)
+            frontier = upcoming
+        return [], None
+
     def analyze_reachability(self, findings: List[Finding]) -> List[Finding]:
         """Perform graph reachability analysis on findings, assigning reachable, blast_radius, and attack_path."""
         entrypoints = [n for n, d in self.graph.nodes(data=True) if d.get("kind") == "ENTRYPOINT"]
@@ -528,20 +608,31 @@ class RiskGraph:
             # Case A: Dependency finding
             if f.engine == "dependency":
                 pkg_name = (f.extra.get("package") or "").lower()
-                pkg_node = f"pkg::{pkg_name}"
+                # The distribution name (PyYAML) is not the import name (yaml), and many dependencies are
+                # only ever imported by another dependency (sqlparse <- Django).
+                pkg_nodes, via_parent = self._dependency_nodes(pkg_name)
+                pkg_node = pkg_nodes[0] if pkg_nodes else f"pkg::{pkg_name}"
 
-                if not self.graph.has_node(pkg_node):
+                if not pkg_nodes:
                     f.package_imported = False
                     f.symbol_reachable = None
-                    # Package is in requirements.txt but NEVER imported anywhere in application code
-                    f.reachable = False
-                    f.exposure = "DEAD"
                     f.blast_radius = 0
-                    f.extra["exposure"] = f.exposure
                     f.extra["attack_path"] = []
+                    if import_names_known(pkg_name):
+                        # We know which name it is imported under, and nothing imports it
+                        f.reachable = False
+                        f.exposure = "DEAD"
+                    else:
+                        # We do NOT know its import name: absence of evidence is not evidence of absence
+                        f.reachable = None
+                        f.exposure = "UNKNOWN"
+                        f.extra["exposure_detail"] = "import name of this package is not known to SCIP; not treated as unused"
+                    f.extra["exposure"] = f.exposure
                     continue
 
-                f.package_imported = True
+                f.package_imported = via_parent is None
+                if via_parent:
+                    f.extra["transitive_via"] = via_parent
                 f.symbol_reachable = None
 
                 # Check component gating
@@ -570,12 +661,16 @@ class RiskGraph:
                             continue
 
                 # Check if any entrypoint can reach pkg_node using O(1) ancestor check
-                ancestors = nx.ancestors(self.graph, pkg_node)
+                ancestors = set()
+                for _n in pkg_nodes:
+                    ancestors |= nx.ancestors(self.graph, _n)
                 reachable_paths = []
                 for ep in entrypoints:
                     if ep in ancestors:
-                        path = nx.shortest_path(self.graph, ep, pkg_node)
-                        reachable_paths.append((ep, path))
+                        for _n in pkg_nodes:
+                            if nx.has_path(self.graph, ep, _n):
+                                reachable_paths.append((ep, nx.shortest_path(self.graph, ep, _n)))
+                                break
 
                 if reachable_paths:
                     reachable_paths.sort(key=lambda item: (-exposure_rank.get(self.graph.nodes[item[0]].get("framework", ""), 0), len(item[1])))
@@ -610,7 +705,9 @@ class RiskGraph:
                     f.extra["attack_path"] = []
 
                 # Upstream blast radius (modules/functions importing or calling this package)
-                ancestors = nx.ancestors(self.graph, pkg_node)
+                ancestors = set()
+                for _n in pkg_nodes:
+                    ancestors |= nx.ancestors(self.graph, _n)
                 prod_callers = {a for a in ancestors if not self.graph.nodes[a].get("is_test") and "entrypoint::" not in a}
                 f.blast_radius = len(prod_callers)
                 continue
@@ -704,17 +801,29 @@ class RiskGraph:
                 f.extra["entrypoints"] = [self.graph.nodes[ep].get("label", ep) for ep, _ in reachable_paths]
             else:
                 is_ep = any(self.graph.has_edge(ep, target_node) for ep in entrypoints)
+                # Used as a value (dispatch table, callback) or exported from a package = evidence of use
+                has_ref = any(
+                    d.get("kind") in ("REFERENCES", "EXPORTS") or d.get("referenced") or d.get("exported")
+                    for _, _, d in self.graph.in_edges(target_node, data=True))
                 if is_test_path(norm_file):
                     f.reachable = False
                     f.exposure = "TEST"
-                elif len(prod_callers) == 0 and not is_ep:
+                elif not entrypoints:
+                    # No web/CLI/worker entrypoint anywhere: a library, a collection of scripts, or a
+                    # framework we do not model. "Not reachable from an entrypoint" is meaningless here.
+                    f.reachable = None
+                    f.exposure = "UNKNOWN"
+                    f.extra["exposure_detail"] = "no entrypoints detected in this repository"
+                elif len(prod_callers) == 0 and not is_ep and not has_ref:
                     f.reachable = False
                     f.exposure = "DEAD"
                     if f.fp_likelihood is None:
-                        f.fp_likelihood = "HIGH"
-                        f.fp_reason = "Unreachable dead code (zero known callers)"
+                        # MEDIUM, never HIGH: a static call graph cannot see dynamic dispatch, plugins,
+                        # getattr(), entry-point strings or callers outside this repository.
+                        f.fp_likelihood = "MEDIUM"
+                        f.fp_reason = "No callers, references or exports found (static analysis can miss dynamic use)"
                 else:
-                    # Proven analyzed: internal callers exist, but zero entrypoint ingress paths
+                    # Proven analyzed: internal callers/references exist, but zero entrypoint ingress paths
                     f.reachable = False
                     f.exposure = "INTNL"
                     if f.fp_likelihood is None:

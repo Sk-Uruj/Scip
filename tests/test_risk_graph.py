@@ -119,22 +119,33 @@ def check():
             extra={"package": "requests"},
         )
 
-        # Finding on unused_lib (never imported)
+        # Django is a package whose import name SCIP knows, and nothing imports it -> provably unused
         f_unused = Finding(
             engine="dependency",
             title="Unused CVE",
             file="requirements.txt",
+            extra={"package": "django"},
+        )
+
+        # A package SCIP knows nothing about: not importing it proves nothing -> UNKNOWN, not DEAD
+        f_unknown = Finding(
+            engine="dependency",
+            title="Unknown CVE",
+            file="requirements.txt",
             extra={"package": "unused_lib"},
         )
 
-        rg.analyze_reachability([f_requests, f_unused])
+        rg.analyze_reachability([f_requests, f_unused, f_unknown])
 
         assert f_requests.reachable is True
         assert len(f_requests.extra.get("attack_path", [])) >= 2
 
-        # Unused package in requirements.txt is marked False!
         assert f_unused.reachable is False
+        assert f_unused.exposure == "DEAD"
         assert f_unused.blast_radius == 0
+
+        assert f_unknown.reachable is None
+        assert f_unknown.exposure == "UNKNOWN"
 
 
 def test_test_caller_exclusion_in_blast_radius():
@@ -255,6 +266,9 @@ def internal_child():
 """
         with open(os.path.join(tmpdir, "helper.py"), "w") as f:
             f.write(code)
+        # the repo has an entrypoint (otherwise "no ingress path" is meaningless), it just never uses helper.py
+        with open(os.path.join(tmpdir, "app.py"), "w") as f:
+            f.write("from flask import Flask\napp = Flask(__name__)\n@app.route('/')\ndef index():\n    return 'ok'\n")
 
         rg = RiskGraph(tmpdir).build(force_rebuild=True)
 

@@ -17,7 +17,7 @@ DEFAULT_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
 
 class SQLiteGraphStore:
     """Stores and loads NetworkX graphs in SQLite with SHA-256 file hash validation."""
-    ANALYZER_VERSION = "2.0"
+    ANALYZER_VERSION = "2.2"
 
     def __init__(self, db_path: Optional[Path] = None, cache_dir: Optional[Path] = None):
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR

@@ -1,0 +1,189 @@
+# SCIP evaluation labels for: pygoat
+# Set `verdict` to  TP (real vulnerability) | FP (false alarm) | UNSURE  - leave "" to skip.
+# Use `note` to record WHY (this is what you explain in the viva). Re-running `template` keeps your work.
+repo: "pygoat"
+findings:
+  # ===== DRAFT labels written by Claude from reading the code - the team must verify each one =====
+  # [secrets] Secret in git history (no longer in current files): Hard-coded secret / API key / token
+  #   evidence: "client_credentials": "********",
+  "challenge/labs/bopla_lab/app.py:41:CWE-798": {verdict: "FP", note: "Git history only. 'client_credentials' is a field of dummy sample project data that the lab deliberately exposes; not a credential for any real system."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded password
+  #   evidence: "password": "********"},
+  "dockerized_labs/auth_failure_lab/app.py:51:CWE-259": {verdict: "TP", note: "Git history only. USERS dict of weak hard-coded passwords that the lab's login actually checks."}
+  # [secrets] Hard-coded secret: Hard-coded password
+  #   evidence: 'password': '********', # Vulnerable: Weak password
+  "dockerized_labs/broken_auth_lab/app.py:13:CWE-259": {verdict: "TP", note: "Weak hard-coded admin password used by the login check (the code comment itself says 'Vulnerable')."}
+  # [secrets] Hard-coded secret: Hard-coded password
+  #   evidence: 'password': '********', # Vulnerable: Weak password
+  "dockerized_labs/broken_auth_lab/app.py:18:CWE-259": {verdict: "TP", note: "Weak hard-coded user password used by the login check."}
+  # [bandit] Bandit B104: Possible binding to all interfaces.
+  #   evidence: 122 if __name__ == '__main__': 123 app.run(host='0.0.0.0', port=5000, debug=True) # Vulnerable: D...
+  "dockerized_labs/broken_auth_lab/app.py:123:CWE-605": {verdict: "TP", note: "app.run(host='0.0.0.0', debug=True): listens on all interfaces with the debugger enabled."}
+  # [dependency] CVE-2026-27205: flask==2.3.3 - Flask session does not add `Vary: Cookie` header when ac...
+  #   evidence: flask==2.3.3
+  "dockerized_labs/broken_auth_lab/requirements.txt:1:CWE-524#CVE-2026-27205": {verdict: "FP", note: "The lab never uses Flask's `session` object; it sets its own 'session' cookie with set_cookie, so the missing 'Vary: Cookie' header issue is not triggered."}
+  # [dependency] CVE-2023-46136: werkzeug==2.3.7 - Werkzeug DoS: High resource usage when parsing multip...
+  #   evidence: werkzeug==2.3.7
+  "dockerized_labs/broken_auth_lab/requirements.txt:2:CWE-400#CVE-2023-46136": {verdict: "TP", note: "The lab reads request.form in its POST handlers, so Werkzeug's multipart parser is reachable with an attacker-chosen body."}
+  # [dependency] CVE-2024-49766: werkzeug==3.0.1 - Werkzeug safe_join not safe on Windows
+  #   evidence: werkzeug==3.0.1
+  "dockerized_labs/insec_des_lab/requirements.txt:2:CWE-22#CVE-2024-49766": {verdict: "FP", note: "Only affects Werkzeug safe_join on Windows. The lab's Dockerfile uses python:3.12-slim (Linux)."}
+  # [dependency] CVE-2025-66221: werkzeug==3.0.1 - Werkzeug safe_join() allows Windows special device names
+  #   evidence: werkzeug==3.0.1
+  "dockerized_labs/insec_des_lab/requirements.txt:2:CWE-67#CVE-2025-66221": {verdict: "FP", note: "Windows-only device-name issue in safe_join. The lab runs in a Linux container."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded secret / API key / token
+  #   evidence: "api_key": "sk_live_****",
+  "dockerized_labs/package_injection_lab/app.py:11:CWE-798": {verdict: "FP", note: "Git history only. Inside SENSITIVE_DATA, commented '# Simulated sensitive data': dummy values the lab shows, not a working credential."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded password
+  #   evidence: "db_password": "********",
+  "dockerized_labs/package_injection_lab/app.py:12:CWE-259": {verdict: "FP", note: "Git history only. Same SENSITIVE_DATA dict of simulated values; not a working credential."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded secret / API key / token
+  #   evidence: 'AWS_SECRET_KEY': '********',
+  "dockerized_labs/sec_misconfig/app.py:44:CWE-798": {verdict: "FP", note: "Git history only. Dummy configuration values that the misconfiguration lab deliberately leaks; not real AWS credentials."}
+  # [dependency] CVE-2025-48432: django==3.2.18 - Django Improper Output Neutralization for Logs vulnera...
+  #   evidence: django==3.2.18
+  "dockerized_labs/sensitive_data_exposure/requirements.txt:1:CWE-117#CVE-2025-48432": {verdict: "UNSURE", note: "Log-injection issue in Django's own request logging. The lab has no custom logging, but default logging may apply. Team to check."}
+  # [dependency] CVE-2023-41164: django==3.2.18 - Django Denial of service vulnerability in django.utils...
+  #   evidence: django==3.2.18
+  "dockerized_labs/sensitive_data_exposure/requirements.txt:1:CWE-1284#CVE-2023-41164": {verdict: "UNSURE", note: "uri_to_iri DoS; Django uses it internally for some URL handling. Cannot tell from the lab code."}
+  # [dependency] CVE-2023-43665: django==3.2.18 - Django Denial-of-service in django.utils.text.Truncator
+  #   evidence: django==3.2.18
+  "dockerized_labs/sensitive_data_exposure/requirements.txt:1:CWE-1284#CVE-2023-43665": {verdict: "FP", note: "Truncator DoS needs the truncatechars/truncatewords template filters. The lab does not use them."}
+  # [dependency] CVE-2026-48588: django==3.2.18 - Django: cache middleware may expose private responses ...
+  #   evidence: django==3.2.18
+  "dockerized_labs/sensitive_data_exposure/requirements.txt:1:CWE-524#CVE-2026-48588": {verdict: "FP", note: "Only affects Django's cache middleware. The lab has no cache middleware or cache settings."}
+  # [dependency] CVE-2026-15307: django==3.2.18 - Django GeoDjango spatial lookups allow file writes and...
+  #   evidence: django==3.2.18
+  "dockerized_labs/sensitive_data_exposure/requirements.txt:1:CWE-73#CVE-2026-15307": {verdict: "FP", note: "GeoDjango only. There is no django.contrib.gis anywhere in pygoat."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded password
+  #   evidence: <pre>SELECT * FROM users WHERE username='admin' AND password='********' OR '1'='1'</pre>
+  "dockerized_labs/sql_injection_lab/templates/index.html:51:CWE-259": {verdict: "FP", note: "Git history only. An example SQL-injection payload written as documentation text inside <pre>; it is not a credential."}
+  # [bandit] Bandit B324: Use of weak MD5 hash for security
+  #   evidence: 160 username = request.POST.get('username') 161 password = md5(password.encode()).hexdigest() 162...
+  "introduction/mitre.py:161:CWE-327": {verdict: "TP", note: "Login hashes the submitted password with MD5 and compares it; MD5 is a weak password hash."}
+  # [semgrep] Semgrep eval-exec: Dynamic code execution via eval() or exec() can lead to arbitrary co...
+  #   evidence: result = eval(expression)
+  "introduction/mitre.py:218:CWE-95": {verdict: "TP", note: "eval(expression) runs text taken from request.POST; the view is also @csrf_exempt. Remote code execution."}
+  # [bandit] Bandit B105: Possible hardcoded password: '********'
+  #   evidence: 16 L.info(f"********") 17 if username == "********" and password == "********": 18 return JsonRes...
+  "introduction/playground/A9/archive.py:17:CWE-259": {verdict: "TP", note: "Login check compares against hard-coded credentials (username == 'admin' and password == 'admin')."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: return render(request,"Lab/sec_mis/sec_mis_lab.html", {"secret": "********"})
+  "introduction/views.py:538:CWE-798": {verdict: "TP", note: "Hard-coded secret string returned to the page when the Host header matches; it lives in source code."}
+  # [bandit] Bandit B105: Possible hardcoded password: '********'
+  #   evidence: 832 return render(request,'********', {'********':True, '********': False}) 833 elif username == ...
+  "introduction/views.py:833:CWE-259": {verdict: "TP", note: "Login branch compares the password with a hard-coded value ('admin_pass')."}
+  # [bandit] Bandit B324: Use of weak MD5 hash for security
+  #   evidence: 1025 try: 1026 password = md5(password.encode()).hexdigest() 1027 user = CF_user.objects.filter(u...
+  "introduction/views.py:1026:CWE-327": {verdict: "TP", note: "Login hashes the submitted password with MD5; weak password hash."}
+  # [secrets] Hard-coded secret: Hard-coded password
+  #   evidence: "User2":{"userid":"2", "username":"User2", "password": "********"},
+  "introduction/views.py:1165:CWE-259": {verdict: "TP", note: "Hard-coded user passwords in a dict that the lab uses for authentication."}
+  # [secrets] Hard-coded secret: Hard-coded password
+  #   evidence: # "User4":{"userid":"4", "username":"User4", "password": "********"}
+  "introduction/views.py:1174:CWE-259": {verdict: "UNSURE", note: "This line is commented-out code (lab user data). Team to decide how to treat secrets that only exist in comments."}
+  # [secrets] Secret in git history (no longer in current files): Hard-coded password
+  #   evidence: elif login.objects.filter(name='jack',password='********'): # Will implement hashing here
+  "pygoat/introduction/views.py:608:CWE-259": {verdict: "TP", note: "Git history only. Login branch checks the hard-coded name 'jack' with a hard-coded password ('Will implement hashing here')."}
+  # [bandit] Bandit B105: Possible hardcoded password: '********'
+  #   evidence: 170 171 SECRET_COOKIE_KEY = "********" 172 CSRF_TRUSTED_ORIGINS = ["********","********","********"]
+  "pygoat/settings.py:171:CWE-259": {verdict: "TP", note: "SECRET_COOKIE_KEY is hard-coded and is the key used to sign the lab's JWT cookie (jwt.encode/decode)."}
+  # [dependency] GHSA-jm77-qphf-c4w8: cryptography==39.0.1 - pyca/cryptography's wheels include vulnerab...
+  #   evidence: cryptography==39.0.1
+  "requirements.txt:7:-#GHSA-JM77-QPHF-C4W8": {verdict: "FP", note: "cryptography is pinned but never imported by the app, so its bundled OpenSSL is never loaded by pygoat code. Verify no other package imports it."}
+  # [dependency] CVE-2026-34073: cryptography==39.0.1 - cryptography has incomplete DNS name constraint ...
+  #   evidence: cryptography==39.0.1
+  "requirements.txt:7:CWE-295#CVE-2026-34073": {verdict: "FP", note: "X.509 name-constraint verification; the app never imports cryptography."}
+  # [dependency] CVE-2024-38875: django==4.2 - Django vulnerable to Denial of Service
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-130#CVE-2024-38875": {verdict: "FP", note: "DoS in the urlize / urlizetrunc filters. No template or code in pygoat uses urlize."}
+  # [dependency] CVE-2023-36053: django==4.2 - Django has regular expression denial of service vulnerabi...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-1333#CVE-2023-36053": {verdict: "TP", note: "ReDoS in EmailValidator/URLValidator. introduction/forms.py uses forms.EmailField(...), so attacker-supplied email text reaches it."}
+  # [dependency] CVE-2025-59682: django==4.2 - Django vulnerable to partial directory traversal via arch...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-23#CVE-2025-59682": {verdict: "FP", note: "Only affects django.utils.archive.extract(). The app never calls it."}
+  # [dependency] CVE-2026-6873: django==4.2 - Django: signed cookies are vulnerable to salt namespace co...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-347#CVE-2026-6873": {verdict: "UNSURE", note: "Salt collision in Django signing. No direct use of signing/get_signed_cookie, but Django's own sessions and messages use signing. Team to check."}
+  # [dependency] CVE-2025-64458: django==4.2 - Django has a denial-of-service vulnerability in HttpRespo...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-407#CVE-2025-64458": {verdict: "FP", note: "DoS only on Windows (redirect URL normalisation). pygoat runs under gunicorn in a Linux container."}
+  # [dependency] CVE-2026-15830: django==4.2 - Django GeoDjango vulnerable to denial of service through ...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-674#CVE-2026-15830": {verdict: "FP", note: "GeoDjango only. pygoat does not use django.contrib.gis."}
+  # [dependency] CVE-2024-24680: django==4.2 - Django denial-of-service attack in the intcomma template ...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-770#CVE-2024-24680": {verdict: "FP", note: "DoS in the intcomma filter from django.contrib.humanize. humanize is not used."}
+  # [dependency] CVE-2024-53907: django==4.2 - Django denial-of-service in django.utils.html.strip_tags()
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-770#CVE-2024-53907": {verdict: "FP", note: "DoS in strip_tags()/striptags. Neither is used in pygoat."}
+  # [dependency] CVE-2026-33034: django==4.2 - Django: SGI requests with a missing or understated `Conte...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-770#CVE-2026-33034": {verdict: "FP", note: "Affects ASGI request handling. pygoat is run with gunicorn on WSGI (Dockerfile CMD and Procfile)."}
+  # [dependency] CVE-2025-13372: django==4.2 - Django is vulnerable to SQL injection in column aliases
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-89#CVE-2025-13372": {verdict: "FP", note: "SQL injection through column aliases needs user-controlled keyword arguments passed to annotate/alias/extra/FilteredRelation. None are used in the app code."}
+  # [dependency] CVE-2025-57833: django==4.2 - Django is subject to SQL injection through its column ali...
+  #   evidence: django==4.2
+  "requirements.txt:11:CWE-89#CVE-2025-57833": {verdict: "FP", note: "Same column-alias SQL injection; the app has no annotate/alias/extra/FilteredRelation calls fed by user input."}
+  # [dependency] CVE-2026-49265: oauthlib==3.2.2 - Oauthlib: Timing Attack Vulnerability in PKCE code_ve...
+  #   evidence: oauthlib==3.2.2
+  "requirements.txt:18:CWE-208#CVE-2026-49265": {verdict: "FP", note: "Provider-side PKCE check. pygoat only uses django-allauth as a client and never imports oauthlib itself."}
+  # [dependency] CVE-2026-49264: oauthlib==3.2.2 - Oauthlib : Unsafe JSONP callback injection in Revocat...
+  #   evidence: oauthlib==3.2.2
+  "requirements.txt:18:CWE-79#CVE-2026-49264": {verdict: "FP", note: "Affects oauthlib's revocation endpoint (OAuth provider). pygoat is not an OAuth provider."}
+  # [dependency] CVE-2023-44271: pillow==9.4.0 - Pillow Denial of Service vulnerability
+  #   evidence: pillow==9.4.0
+  "requirements.txt:19:CWE-400#CVE-2023-44271": {verdict: "FP", note: "DoS in ImageDraw text drawing. The app imports only Image and ImageMath."}
+  # [dependency] CVE-2026-59204: pillow==9.4.0 - Pillow JPEG2000 tiled decode retains a growing scratch ...
+  #   evidence: pillow==9.4.0
+  "requirements.txt:19:CWE-770#CVE-2026-59204": {verdict: "TP", note: "The app calls Image.open(file) on a user upload (views.py:584). Pillow detects the format itself, so an attacker can upload a JPEG2000 file."}
+  # [dependency] CVE-2026-55380: pillow==9.4.0 - Pillow `GdImageFile._open()`: image dimensions accepted...
+  #   evidence: pillow==9.4.0
+  "requirements.txt:19:CWE-789#CVE-2026-55380": {verdict: "UNSURE", note: "GdImageFile issue. The app only calls Image.open, and I believe GD files are not opened that way. Team to confirm."}
+  # [dependency] CVE-2023-50447: pillow==9.4.0 - Arbitrary Code Execution in Pillow
+  #   evidence: pillow==9.4.0
+  "requirements.txt:19:CWE-94#CVE-2023-50447": {verdict: "TP", note: "views.py:588 runs ImageMath.eval(function_str, ...) where function_str comes from the request: arbitrary code execution."}
+  # [dependency] CVE-2026-102270: pyjwt==2.4.0 - PyJWT: ReDoS vulnerability when calling the `is_pem_for...
+  #   evidence: pyjwt==2.4.0
+  "requirements.txt:24:CWE-1333#CVE-2026-102270": {verdict: "FP", note: "ReDoS in PEM detection on the key argument. The key is the server-side constant SECRET_COOKIE_KEY, not attacker input."}
+  # [dependency] CVE-2026-102275: pyjwt==2.4.0 - PyJWT accepts inconsistent OKP x/d JWKs, causing public...
+  #   evidence: pyjwt==2.4.0
+  "requirements.txt:24:CWE-345#CVE-2026-102275": {verdict: "FP", note: "JWK (OKP) handling. pygoat only uses HS256 with a shared secret; no JWKs."}
+  # [dependency] CVE-2026-32597: pyjwt==2.4.0 - PyJWT accepts unknown `crit` header extensions
+  #   evidence: pyjwt==2.4.0
+  "requirements.txt:24:CWE-345#CVE-2026-32597": {verdict: "TP", note: "jwt.decode runs on the attacker-controlled auth_cookie (views.py:1095, also mitre.py), so tokens with unknown 'crit' headers are accepted."}
+  # [dependency] CVE-2026-48522: pyjwt==2.4.0 - PyJWKClient: missing scheme allowlist enables CVE-2024-2...
+  #   evidence: pyjwt==2.4.0
+  "requirements.txt:24:CWE-441#CVE-2026-48522": {verdict: "FP", note: "Affects PyJWKClient. It is not used in pygoat."}
+  # [dependency] CVE-2020-14343: pyyaml==5.1 - Improper Input Validation in PyYAML
+  #   evidence: pyyaml==5.1
+  "requirements.txt:27:CWE-20#CVE-2020-14343": {verdict: "TP", note: "views.py:560 calls yaml.load(file, yaml.Loader) on an uploaded file: the vulnerable loader on attacker input."}
+  # [dependency] CVE-2026-25645: requests==2.28.2 - Requests has Insecure Temp File Reuse in its extract...
+  #   evidence: requests==2.28.2
+  "requirements.txt:28:CWE-377#CVE-2026-25645": {verdict: "FP", note: "Only relevant when requests itself runs from a zip archive (extract_zipped_paths). pygoat runs it normally."}
+  # [dependency] CVE-2024-47081: requests==2.28.2 - Requests vulnerable to .netrc credentials leak via m...
+  #   evidence: requests==2.28.2
+  "requirements.txt:28:CWE-522#CVE-2024-47081": {verdict: "UNSURE", note: "views.py:963 does requests.get(url) with a user-supplied URL, but the leak needs a .netrc credentials file on the server. Team to decide."}
+  # [dependency] CVE-2023-30608: sqlparse==0.3.1 - sqlparse contains a regular expression that is vulner...
+  #   evidence: sqlparse==0.3.1
+  "requirements.txt:30:CWE-1333#CVE-2023-30608": {verdict: "FP", note: "sqlparse is not imported by pygoat. Django only uses it for migrations/management commands with developer-written SQL, not request data."}
+  # [dependency] GHSA-27jp-wm6q-gp25: sqlparse==0.3.1 - sqlparse: formatting list of tuples leads to den...
+  #   evidence: sqlparse==0.3.1
+  "requirements.txt:30:CWE-770#GHSA-27JP-WM6Q-GP25": {verdict: "FP", note: "Same as above: sqlparse is only used by Django management/migration code, not on request data."}
+  # [dependency] CVE-2026-97687: urllib3==1.26.9 - urllib3: HTTPS proxy TLS configuration may be ignored...
+  #   evidence: urllib3==1.26.9
+  "requirements.txt:31:CWE-295#CVE-2026-97687": {verdict: "FP", note: "Only matters when an HTTPS proxy is configured. pygoat configures none."}
+  # [dependency] CVE-2026-21441: urllib3==1.26.9 - Decompression-bomb safeguards bypassed when following...
+  #   evidence: urllib3==1.26.9
+  "requirements.txt:31:CWE-409#CVE-2026-21441": {verdict: "UNSURE", note: "Decompression-bomb safeguard bypass on redirects. requests.get(url) follows redirects for user URLs, but impact depends on streaming use. Team to decide."}
+  # [dependency] CVE-2024-37891: urllib3==1.26.9 - urllib3's Proxy-Authorization request header isn't st...
+  #   evidence: urllib3==1.26.9
+  "requirements.txt:31:CWE-669#CVE-2024-37891": {verdict: "FP", note: "Proxy-Authorization header leak applies only when a proxy is used. pygoat configures none."}
+  # [dependency] CVE-2025-66221: werkzeug==2.1.2 - Werkzeug safe_join() allows Windows special device names
+  #   evidence: werkzeug==2.1.2
+  "requirements.txt:32:CWE-67#CVE-2025-66221": {verdict: "FP", note: "Windows-only issue, and the main app is Django: it does not import Werkzeug."}
+expected:
+  # - {file: bad/libuser.py, line: 12, tol: 2, cwe: CWE-89, note: "SQL injection in login"}
+  []

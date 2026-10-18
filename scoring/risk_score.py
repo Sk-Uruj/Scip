@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -122,41 +123,62 @@ def _normalize_to_repo_rel(file_path: str, repo_path: str) -> str:
     return norm
 
 
+def _valid_weight(value: float) -> bool:
+    """A weight must be a finite number in [0, 1]. Anything else is ignored."""
+    return math.isfinite(value) and 0.0 <= value <= 1.0
+
+
 def load_weights(repo_path: Optional[str] = None) -> Dict[str, float]:
-    """Load scoring weights from .env file or environment variables."""
+    """Load scoring weights from SCIP's OWN .env file or from environment variables.
+
+    Security: ``repo_path`` (the repository being scanned) is deliberately NOT a source of
+    configuration. Its files are attacker-controlled input: a hostile ``.env`` could zero the
+    weight of every real risk factor and reverse the ranking. A ``WEIGHT_*`` setting found there
+    is ignored (and reported at debug level).
+    """
     weights = dict(DEFAULT_WEIGHTS)
 
-    env_paths = []
     if repo_path:
-        env_paths.append(Path(repo_path).resolve() / ".env")
-    env_paths.append(Path(__file__).resolve().parent.parent / ".env")
+        untrusted = Path(repo_path).resolve() / ".env"
+        if untrusted.exists():
+            log.debug("Ignoring untrusted .env inside the scanned repository: %s", untrusted)
 
-    for env_path in env_paths:
-        if env_path.exists():
-            try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            k, v = k.strip().upper(), v.strip()
-                            if k in weights:
-                                try:
-                                    weights[k] = float(v)
-                                except ValueError:
-                                    pass
-                break
-            except Exception as e:
-                log.debug("Error reading .env from %s: %s", env_path, e)
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if env_path.exists():
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip().upper(), v.strip()
+                        if k in weights:
+                            try:
+                                value = float(v)
+                            except ValueError:
+                                continue
+                            if _valid_weight(value):
+                                weights[k] = value
+                            else:
+                                log.warning("Ignoring out-of-range weight %s=%s in %s", k, v, env_path)
+        except Exception as e:
+            log.debug("Error reading .env from %s: %s", env_path, e)
 
-    # Allow environment variable overrides
+    # Allow environment variable overrides (set by the person running SCIP)
     for k in weights:
         if k in os.environ:
             try:
-                weights[k] = float(os.environ[k])
+                value = float(os.environ[k])
             except ValueError:
-                pass
+                continue
+            if _valid_weight(value):
+                weights[k] = value
+            else:
+                log.warning("Ignoring out-of-range weight %s=%s", k, os.environ[k])
 
+    if sum(weights.values()) <= 0:               # all zero would make every score identical
+        log.warning("All scoring weights are zero; falling back to defaults")
+        weights = dict(DEFAULT_WEIGHTS)
     return weights
 
 
@@ -347,6 +369,7 @@ def score_and_sort_findings(
     repo_path: Optional[str] = None,
     weights: Optional[Dict[str, float]] = None,
     config: Optional[ScoringConfig] = None,
+    training_paths: Optional[List[str]] = None,
 ) -> List[Finding]:
     """Score all findings and sort in descending order of risk_score (highest risk on top)."""
     weights = weights or load_weights(repo_path=repo_path)
@@ -384,7 +407,7 @@ def score_and_sort_findings(
         # Detect and tag safe-by-design / protocol-mandated false positives
         try:
             from core.fp_detector import detect_false_positives
-            detect_false_positives(findings, repo_path=repo_path)
+            detect_false_positives(findings, repo_path=repo_path, training_paths=training_paths or ())
         except Exception as e:
             log.debug("FP detection error: %s", e)
 

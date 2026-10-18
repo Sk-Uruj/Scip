@@ -128,17 +128,52 @@ def test_weight_normalization_with_custom_weights():
 
 
 def test_env_override_and_file_loading(monkeypatch, tmp_path):
-    env_file = tmp_path / ".env"
-    env_file.write_text("WEIGHT_CVSS=0.50\nWEIGHT_BLAST=0.20\n", encoding="utf-8")
-
+    # A .env inside the SCANNED repo is untrusted input and must be ignored
+    (tmp_path / ".env").write_text("WEIGHT_CVSS=0.50\nWEIGHT_BLAST=0.20\n", encoding="utf-8")
     weights = load_weights(repo_path=str(tmp_path))
-    assert weights["WEIGHT_CVSS"] == 0.50
-    assert weights["WEIGHT_BLAST"] == 0.20
+    assert weights["WEIGHT_CVSS"] == DEFAULT_WEIGHTS["WEIGHT_CVSS"]
+    assert weights["WEIGHT_BLAST"] == DEFAULT_WEIGHTS["WEIGHT_BLAST"]
 
-    # Environment variable has highest priority
+    # Environment variables (set by the person running SCIP) still have the highest priority
     monkeypatch.setenv("WEIGHT_CVSS", "0.80")
     weights2 = load_weights(repo_path=str(tmp_path))
     assert weights2["WEIGHT_CVSS"] == 0.80
+
+
+def test_invalid_weights_are_ignored(monkeypatch):
+    for bad in ("nan", "inf", "-0.5", "7"):
+        monkeypatch.setenv("WEIGHT_CVSS", bad)
+        assert load_weights()["WEIGHT_CVSS"] == DEFAULT_WEIGHTS["WEIGHT_CVSS"], bad
+
+
+def test_all_zero_weights_fall_back_to_defaults(monkeypatch):
+    for k in DEFAULT_WEIGHTS:
+        monkeypatch.setenv(k, "0")
+    assert load_weights() == DEFAULT_WEIGHTS
+
+
+def test_hostile_repo_env_cannot_reverse_the_ranking(tmp_path):
+    """Regression: a scanned repo shipping WEIGHT_*=0 used to score an actively exploited RCE 0.0
+    and a trivial finding 50.0, i.e. reverse the ranking."""
+    clean_repo = tmp_path / "clean"
+    hostile_repo = tmp_path / "hostile"
+    clean_repo.mkdir()
+    hostile_repo.mkdir()
+    (hostile_repo / ".env").write_text(
+        "WEIGHT_CVSS=0\nWEIGHT_EPSS=0\nWEIGHT_KEV=0\nWEIGHT_BLAST=0\n"
+        "WEIGHT_CHURN=0\nWEIGHT_HEALTH=0\nWEIGHT_REACH=1\n", encoding="utf-8")
+
+    def make():
+        return [
+            Finding(engine="dependency", title="exploited RCE (KEV)", file="a", severity=9.8,
+                    exploitability=1.0, extra={"epss": 1.0, "kev": True}),
+            Finding(engine="bandit", title="minor info", file="b", severity=2.0, exploitability=0.1),
+        ]
+
+    clean = {f.title: f.risk_score for f in score_and_sort_findings(make(), repo_path=str(clean_repo))}
+    hostile = {f.title: f.risk_score for f in score_and_sort_findings(make(), repo_path=str(hostile_repo))}
+    assert hostile == clean
+    assert hostile["exploited RCE (KEV)"] > hostile["minor info"] + 20
 
 
 def test_safe_defaults_no_attribute_error():

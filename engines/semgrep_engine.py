@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.finding import Finding
+from core.redact import redact_finding
 from core.taxonomy import normalize_cwe
 from engines.base import Engine, rel_path
 
@@ -252,7 +253,7 @@ class SemgrepEngine(Engine):
         if fingerprint == "requires login":
             fingerprint = None
 
-        return Finding(
+        return redact_finding(Finding(
             engine=self.name,
             title=title,
             file=normalized_file,
@@ -274,4 +275,4 @@ class SemgrepEngine(Engine):
                 "end": end,
                 "line_range": line_range,
             },
-        )
+        ))

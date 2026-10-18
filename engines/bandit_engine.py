@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from core.finding import Finding
+from core.redact import redact_finding
 from core.taxonomy import normalize_cwe
 from engines.base import Engine, rel_path
 
@@ -252,7 +253,7 @@ class BanditEngine(Engine):
         # Evidence
         code_snippet = (r.get("code") or "").strip()
 
-        return Finding(
+        return redact_finding(Finding(
             engine=self.name,
             title=f"Bandit {test_id}: {summary}",
             file=normalized_file,
@@ -273,4 +274,4 @@ class BanditEngine(Engine):
                 "end_col_offset": r.get("end_col_offset"),
                 "more_info": r.get("more_info", ""),
             },
-        )
+        ))
