@@ -7,10 +7,15 @@ import pytest
 
 from remediation.apply import apply_upgrades, make_workspace
 from remediation.code_patcher import (
+    RULE_PATCHERS,
+    PatchStatus,
+    PatchTier,
     apply_code_patches,
     can_auto_patch,
     generate_file_patch,
-    patch_line,
+    patch_file_content,
+    patch_single_snippet,
+    safe_resolve_target,
 )
 from remediation.plan import Plan, Upgrade, jump_size, plan_upgrades
 from remediation.run import main
@@ -294,85 +299,200 @@ def test_cli_bad_inputs_return_2(tmp_path, capsys):
     assert main([str(repo), "--scan", str(tmp_path / "nope.json")]) == 2
 
 
-# ------------------------------------------------------------------ Code Patcher (Step 9)
-def test_code_patcher_can_auto_patch():
-    assert can_auto_patch({"title": "Bandit B506: yaml.load", "extra": {"test_id": "B506"}}) is True
-    assert can_auto_patch({"title": "Bandit B303: MD5", "extra": {"test_id": "B303"}}) is True
-    assert can_auto_patch({"title": "Bandit B201: debug=True", "extra": {"test_id": "B201"}}) is True
-    assert can_auto_patch({"title": "Bandit B306: mktemp", "extra": {"test_id": "B306"}}) is True
-    assert can_auto_patch({"title": "Bandit B113: requests timeout", "extra": {"test_id": "B113"}}) is True
-    assert can_auto_patch({"title": "Bandit B102: exec", "extra": {"test_id": "B102"}}) is False
+# ------------------------------------------------------------------ Code Patcher
+def test_code_patcher_can_auto_patch_registry():
+    """Verify that can_auto_patch accurately reflects the single RULE_PATCHERS registry."""
+    for auto_id in ["B201", "B113", "B506", "B303", "B501", "B614", "B701"]:
+        assert can_auto_patch({"extra": {"test_id": auto_id}}) is True
+    # Non-auto-fixable or rejected rules
+    for non_auto in ["B102", "B306", "B324", "B602", "B604"]:
+        assert can_auto_patch({"extra": {"test_id": non_auto}}) is False
 
 
-def test_code_patcher_patch_line():
-    patched, reason = patch_line("    data = yaml.load(f, Loader=yaml.Loader)", "B506")
-    assert patched == "    data = yaml.safe_load(f)"
-    assert reason == ""
+def test_code_patcher_nested_calls_and_trailing_commas():
+    """Verify that nested function calls and trailing commas are never mangled by AST patching."""
+    # 1. Nested call in requests.get
+    code1 = "r = requests.get(url, headers=get_headers())"
+    out1, reason1 = patch_single_snippet(code1, "B113")
+    assert out1 == "r = requests.get(url, headers=get_headers(), timeout=10)"
+    assert reason1 == ""
 
-    # Line where pattern doesn't match
-    failed, reason = patch_line("    x = 1 + 2", "B506")
-    assert failed is None
-    assert "not found" in reason
+    # 2. Trailing comma in requests.get
+    code2 = "r = requests.get(url,)"
+    out2, reason2 = patch_single_snippet(code2, "B113")
+    assert out2 == "r = requests.get(url, timeout=10)"
+
+    # 3. Bare call without args
+    code3 = "r = requests.get()"
+    out3, reason3 = patch_single_snippet(code3, "B113")
+    assert out3 == "r = requests.get(timeout=10)"
+
+    # 4. Nested call in torch.load
+    code4 = 'm = torch.load(f, map_location=torch.device("cpu"))'
+    out4, reason4 = patch_single_snippet(code4, "B614")
+    assert out4 == 'm = torch.load(f, map_location=torch.device("cpu"), weights_only=True)'
 
 
-def test_code_patcher_generate_file_patch():
-    content = (
-        "import yaml\n"
-        "import hashlib\n"
-        "\n"
-        "def load_config(f):\n"
-        "    return yaml.load(f)\n"
-        "\n"
-        "def compute_hash(data):\n"
-        "    return hashlib.md5(data).hexdigest()\n"
-    )
-    findings = [
-        {"file": "app.py", "line": 5, "extra": {"test_id": "B506", "remediation": {"auto_fixable": True}}},
-        {"file": "app.py", "line": 8, "extra": {"test_id": "B303", "remediation": {"auto_fixable": True}}},
+def test_code_patcher_yaml_loader_variations():
+    """Verify that yaml.load removes both positional and keyword loaders to prevent TypeErrors."""
+    cases = [
+        ("data = yaml.load(f)", "data = yaml.safe_load(f)"),
+        ("data = yaml.load(f, yaml.Loader)", "data = yaml.safe_load(f)"),
+        ("data = yaml.load(f, Loader=Loader)", "data = yaml.safe_load(f)"),
+        ("data = yaml.load(f, Loader=yaml.CLoader)", "data = yaml.safe_load(f)"),
     ]
-    new_content, diff, edits = generate_file_patch("app.py", content, findings)
-    assert "yaml.safe_load(f)" in new_content
-    assert "hashlib.sha256(data).hexdigest()" in new_content
-    assert "-    return yaml.load(f)" in diff
-    assert "+    return yaml.safe_load(f)" in diff
-    assert "-    return hashlib.md5(data).hexdigest()" in diff
-    assert "+    return hashlib.sha256(data).hexdigest()" in diff
-    assert len(edits) == 2
-    assert all(e.applied for e in edits)
+    for orig, expected in cases:
+        out, reason = patch_single_snippet(orig, "B506")
+        assert out == expected
+        assert reason == ""
 
 
-def test_code_patcher_apply_code_patches_leaves_original_untouched(tmp_path):
+def test_code_patcher_multi_line_call():
+    """Verify multi-line call patching with trailing comma."""
+    code = (
+        "res = requests.get(\n"
+        "    url,\n"
+        "    headers=get_headers(),\n"
+        ")\n"
+    )
+    out, reason = patch_single_snippet(code, "B113", line_no=1)
+    assert out is not None
+    assert "timeout=10" in out
+    assert "headers=get_headers()" in out
+
+
+def test_code_patcher_review_tiers():
+    """Verify that mechanical fixes and fixes requiring human review are distinctly tiered."""
+    # B201 is mechanical
+    _, edits_b201 = patch_file_content("app.run(debug=True)", [{"line": 1, "extra": {"test_id": "B201"}}])
+    assert len(edits_b201) == 1
+    assert edits_b201[0].tier == PatchTier.MECHANICAL.value
+
+    # B113 and B506 need review
+    _, edits_b113 = patch_file_content("requests.get(url)", [{"line": 1, "extra": {"test_id": "B113"}}])
+    assert edits_b113[0].tier == PatchTier.NEEDS_REVIEW.value
+
+    _, edits_b506 = patch_file_content("yaml.load(f)", [{"line": 1, "extra": {"test_id": "B506"}}])
+    assert edits_b506[0].tier == PatchTier.NEEDS_REVIEW.value
+
+
+def test_code_patcher_crlf_roundtrip(tmp_path):
+    """Verify that CRLF line endings are preserved byte-for-byte in the patched workspace."""
     repo = tmp_path / "repo"
     repo.mkdir()
     app_py = repo / "app.py"
-    app_py.write_text(
-        "import flask\n"
-        "app = flask.Flask(__name__)\n"
-        "app.run(host='0.0.0.0', port=5000, debug=True)\n",
-        encoding="utf-8",
-    )
-    before_bytes = app_py.read_bytes()
+    app_content = "import flask\r\napp = flask.Flask(__name__)\r\napp.run(debug=True)\r\n"
+    app_py.write_bytes(app_content.encode("utf-8"))
 
-    findings = [
-        {
-            "file": "app.py",
-            "line": 3,
-            "extra": {"test_id": "B201", "remediation": {"auto_fixable": True}},
-        }
-    ]
-
-    dest_ws = tmp_path / "workspace"
+    findings = [{"file": "app.py", "line": 3, "extra": {"test_id": "B201"}}]
+    dest_ws = tmp_path / "ws"
     result = apply_code_patches(repo, findings, dest_path=dest_ws)
 
-    # 1. Original repository file is never touched
-    assert app_py.read_bytes() == before_bytes
+    patched_file = result.workspace / "app.py"
+    raw_patched = patched_file.read_bytes()
+    # Ensure every newline in the patched file is CRLF (\r\n) and not normalized to LF
+    assert b"\r\n" in raw_patched
+    assert b"\n" not in raw_patched.replace(b"\r\n", b"")
+    assert b"debug=False" in raw_patched
 
-    # 2. Workspace copy has the patch applied
-    patched_ws_app = result.workspace / "app.py"
-    assert patched_ws_app.exists()
-    assert "debug=False" in patched_ws_app.read_text(encoding="utf-8")
-    assert "-app.run(host='0.0.0.0', port=5000, debug=True)" in result.diff
-    assert "+app.run(host='0.0.0.0', port=5000, debug=False)" in result.diff
-    assert len(result.applied) == 1
-    assert result.applied[0].test_id == "B201"
+
+def test_code_patcher_encoding_cookie_roundtrip(tmp_path):
+    """Verify that encoding cookies (e.g. latin-1) are detected and preserved."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    app_py = repo / "app.py"
+    # File in ISO-8859-1 with accent character
+    content = "# -*- coding: iso-8859-1 -*-\n# auteur: Ren\xe9\nimport flask\napp.run(debug=True)\n"
+    app_py.write_bytes(content.encode("iso-8859-1"))
+
+    findings = [{"file": "app.py", "line": 4, "extra": {"test_id": "B201"}}]
+    dest_ws = tmp_path / "ws_enc"
+    result = apply_code_patches(repo, findings, dest_path=dest_ws)
+
+    patched_file = result.workspace / "app.py"
+    # Ensure file can be read as iso-8859-1 and contains the patched code
+    patched_bytes = patched_file.read_bytes()
+    assert b"debug=False" in patched_bytes
+    assert b"Ren\xe9" in patched_bytes
+
+
+def test_code_patcher_formfeed_line_numbering():
+    """Verify that formfeed \\f characters do not desynchronize line indexing."""
+    content = "import yaml\n\x0c\ndata = yaml.load(f)\n"
+    # yaml.load is on line 3 (formfeed is line 2)
+    new_content, edits = patch_file_content(content, [{"line": 3, "extra": {"test_id": "B506"}}])
+    assert len(edits) == 1
+    assert edits[0].applied is True
+    assert "yaml.safe_load(f)" in new_content
+
+
+def test_code_patcher_no_trailing_newline_diff():
+    """Verify that files lacking trailing newlines generate clean unified diffs."""
+    orig = "import flask\napp.run(debug=True)"
+    new_content, diff, edits = generate_file_patch("app.py", orig, [{"line": 2, "extra": {"test_id": "B201"}}])
+    assert len(edits) == 1
+    assert edits[0].applied is True
+    assert "-app.run(debug=True)" in diff
+    assert "+app.run(debug=False)" in diff
+
+
+def test_code_patcher_sandbox_path_traversal_rejection(tmp_path):
+    """Verify that path traversal attempts in finding paths are rejected."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "legit.py").write_text("import flask\napp.run(debug=True)\n", encoding="utf-8")
+
+    findings = [
+        {"file": "../../etc/passwd", "line": 1, "extra": {"test_id": "B201"}},
+        {"file": "/etc/shadow", "line": 1, "extra": {"test_id": "B201"}},
+        {"file": "C:/Windows/System32/drivers/etc/hosts", "line": 1, "extra": {"test_id": "B201"}},
+    ]
+    dest_ws = tmp_path / "ws_traversal"
+    result = apply_code_patches(repo, findings, dest_path=dest_ws)
+    assert len(result.applied) == 0
+    assert len(result.skipped) == 3
+    for s in result.skipped:
+        assert s.status == PatchStatus.PATH_TRAVERSAL.value
+
+
+def test_code_patcher_sandbox_symlink_rejection(tmp_path):
+    """Verify that symlinks inside the workspace are rejected to prevent escaping."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    real_file = tmp_path / "external_secret.py"
+    real_file.write_text("import flask\napp.run(debug=True)\n", encoding="utf-8")
+
+    link_path = repo / "link.py"
+    try:
+        link_path.symlink_to(real_file)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks not supported on this OS/user privileges")
+
+    findings = [{"file": "link.py", "line": 2, "extra": {"test_id": "B201"}}]
+    dest_ws = tmp_path / "ws_symlink"
+    result = apply_code_patches(repo, findings, dest_path=dest_ws)
+    assert len(result.applied) == 0
+    assert result.skipped[0].status == PatchStatus.SYMLINK_SKIPPED.value
+
+
+def test_code_patcher_syntax_error_safety_net():
+    """Verify that invalid syntax in source or patch is rejected by the safety net."""
+    broken_code = "def foo(\n   broken syntax"
+    new_content, edits = patch_file_content(broken_code, [{"line": 1, "extra": {"test_id": "B201"}}])
+    assert new_content == broken_code
+    assert len(edits) == 1
+    assert edits[0].status == PatchStatus.SYNTAX_ERROR.value
+
+
+def test_code_patcher_default_dest_is_unique(tmp_path):
+    """Verify that default dest_path=None generates unique paths preventing collisions."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app.py").write_text("import flask\napp.run(debug=True)\n", encoding="utf-8")
+
+    r1 = apply_code_patches(repo, [{"file": "app.py", "line": 2, "extra": {"test_id": "B201"}}])
+    r2 = apply_code_patches(repo, [{"file": "app.py", "line": 2, "extra": {"test_id": "B201"}}])
+    assert r1.workspace != r2.workspace
+    assert r1.workspace.exists() and r2.workspace.exists()
+
 

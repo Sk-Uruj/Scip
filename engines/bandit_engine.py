@@ -136,7 +136,7 @@ RULE_EXPLOIT_BASE: Dict[str, float] = {k: v[1] for k, v in BANDIT_RULE_CALIBRATI
 COMMON_FIX_HINTS: Dict[str, str] = {
     # B1xx: General & Hardcoded Credentials / Misc
     "B101": "Use explicit error handling or validation checks instead of assert in production code.",
-    "B102": "Avoid exec(). Refactor code to use safe alternatives, dispatch tables, or ast.literal_eval().",
+    "B102": "Avoid exec(). Refactor code to use explicit functions, dispatch tables, or dynamic module loading via importlib.",
     "B103": "Avoid overly permissive file permissions (e.g. 0o777). Use restricted permissions like 0o600 or 0o700.",
     "B104": "Avoid binding to all interfaces (0.0.0.0). Bind explicitly to 127.0.0.1 or a specific internal IP.",
     "B105": "Store passwords and secrets in environment variables or a secrets manager, not hardcoded in source code.",
@@ -157,7 +157,7 @@ COMMON_FIX_HINTS: Dict[str, str] = {
     "B303": "Use a secure cryptographic hash (e.g. hashlib.sha256()) instead of MD5/SHA1.",
     "B304": "Avoid weak ciphers (e.g. DES, ARC4). Use AES-GCM or ChaCha20-Poly1305 from cryptography library.",
     "B305": "Avoid weak cipher modes. Use authenticated cipher modes like AES-GCM.",
-    "B306": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp().",
+    "B306": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp(). Note that NamedTemporaryFile returns a file object, while mkstemp returns (fd, path).",
     "B307": "Avoid eval(). Use ast.literal_eval() for parsing literals or refactor logic without dynamic evaluation.",
     "B308": "Avoid django.utils.safestring.mark_safe() on untrusted user input to prevent Cross-Site Scripting (XSS).",
     "B309": "Avoid HTTPSConnection without SSL certificate verification. Use requests or http.client with a verified SSLContext.",
@@ -196,8 +196,8 @@ COMMON_FIX_HINTS: Dict[str, str] = {
     # B5xx: SSL / TLS / Cryptography
     "B501": "Do not set verify=False on HTTPS requests. Ensure valid certificates are trusted.",
     "B502": "Avoid deprecated SSL/TLS protocols (SSLv2, SSLv3, TLSv1, TLSv1.1). Use ssl.PROTOCOL_TLS_CLIENT with TLSv1.2+.",
-    "B503": "Do not create SSL contexts without SNI and certificate verification. Use ssl.create_default_context().",
-    "B504": "Do not disable certificate revocation checks. Ensure CRL/OCSP checking is properly configured if used.",
+    "B503": "Avoid using insecure SSL/TLS protocol versions as default parameter values. Use ssl.create_default_context().",
+    "B504": "Specify a modern TLS protocol version (e.g. ssl.PROTOCOL_TLS_CLIENT with TLSv1.2+) when calling ssl.wrap_socket().",
     "B505": "Weak cryptographic key size detected. Use RSA keys of at least 2048 bits or ECC with curves P-256+.",
     "B506": "Use yaml.safe_load() instead of yaml.load() to prevent arbitrary code execution.",
     "B507": "Do not disable SSH host key verification (AutoAddPolicy). Use RejectPolicy and manage known_hosts.",
@@ -228,13 +228,31 @@ COMMON_FIX_HINTS: Dict[str, str] = {
     "B704": "markupsafe.Markup() bypasses escaping and can introduce XSS. Use escape() before wrapping in Markup().",
 }
 
-# Structured remediation templates for auto-patching and high-value fixes (Step 9 Integration)
+# Structured remediation templates for auto-patching and high-value fixes
 REMEDIATION_TEMPLATES: Dict[str, Dict[str, Any]] = {
-    # Top 5 Auto-Fixable Rules
+    # Mechanical fixes
+    "B201": {
+        "safe_alternative": "debug=False",
+        "import_required": None,
+        "auto_fixable": True,
+        "tier": "mechanical",
+        "replacement_pattern": "app.run(..., debug=False)",
+        "description": "Disable debug mode in Flask app.run().",
+    },
+    # Fixes requiring review
+    "B113": {
+        "safe_alternative": "timeout=10",
+        "import_required": None,
+        "auto_fixable": True,
+        "tier": "needs_review",
+        "replacement_pattern": "requests.{method}(..., timeout=10)",
+        "description": "Add explicit timeout parameter to HTTP requests call.",
+    },
     "B506": {
         "safe_alternative": "yaml.safe_load",
         "import_required": "yaml",
         "auto_fixable": True,
+        "tier": "needs_review",
         "replacement_pattern": "yaml.safe_load({arg})",
         "description": "Replace unsafe yaml.load() with yaml.safe_load().",
     },
@@ -242,78 +260,23 @@ REMEDIATION_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "safe_alternative": "hashlib.sha256",
         "import_required": "hashlib",
         "auto_fixable": True,
+        "tier": "needs_review",
         "replacement_pattern": "hashlib.sha256({arg})",
         "description": "Replace weak MD5/SHA1 hash with hashlib.sha256().",
-    },
-    "B201": {
-        "safe_alternative": "debug=False",
-        "import_required": None,
-        "auto_fixable": True,
-        "replacement_pattern": "app.run(..., debug=False)",
-        "description": "Disable debug mode in Flask app.run().",
-    },
-    "B306": {
-        "safe_alternative": "tempfile.NamedTemporaryFile",
-        "import_required": "tempfile",
-        "auto_fixable": True,
-        "replacement_pattern": "tempfile.NamedTemporaryFile()",
-        "description": "Replace insecure tempfile.mktemp() with tempfile.NamedTemporaryFile().",
-    },
-    "B113": {
-        "safe_alternative": "timeout=10",
-        "import_required": None,
-        "auto_fixable": True,
-        "replacement_pattern": "requests.{method}(..., timeout=10)",
-        "description": "Add explicit timeout parameter to HTTP requests call.",
-    },
-
-    # Additional high-value structured guidance
-    "B102": {
-        "safe_alternative": "ast.literal_eval",
-        "import_required": "ast",
-        "auto_fixable": False,
-        "replacement_pattern": "ast.literal_eval({arg})",
-        "description": "Refactor dynamic exec() to safe evaluation or dispatch table.",
-    },
-    "B307": {
-        "safe_alternative": "ast.literal_eval",
-        "import_required": "ast",
-        "auto_fixable": False,
-        "replacement_pattern": "ast.literal_eval({arg})",
-        "description": "Replace eval() with ast.literal_eval() for literal evaluation.",
-    },
-    "B324": {
-        "safe_alternative": "usedforsecurity=False",
-        "import_required": None,
-        "auto_fixable": True,
-        "replacement_pattern": "hashlib.new(..., usedforsecurity=False)",
-        "description": "Specify usedforsecurity=False for non-cryptographic hashing.",
     },
     "B501": {
         "safe_alternative": "verify=True",
         "import_required": None,
         "auto_fixable": True,
+        "tier": "needs_review",
         "replacement_pattern": "requests.{method}(..., verify=True)",
         "description": "Enable TLS certificate verification on HTTPS request.",
-    },
-    "B602": {
-        "safe_alternative": "shell=False",
-        "import_required": "shlex",
-        "auto_fixable": False,
-        "replacement_pattern": "subprocess.run(shlex.split({cmd}), shell=False)",
-        "description": "Pass arguments as a list and set shell=False.",
-    },
-    "B604": {
-        "safe_alternative": "shell=False",
-        "import_required": None,
-        "auto_fixable": True,
-        "replacement_pattern": "func(..., shell=False)",
-        "description": "Set shell=False in function call.",
     },
     "B614": {
         "safe_alternative": "weights_only=True",
         "import_required": None,
         "auto_fixable": True,
+        "tier": "needs_review",
         "replacement_pattern": "torch.load(..., weights_only=True)",
         "description": "Specify weights_only=True in torch.load().",
     },
@@ -321,85 +284,69 @@ REMEDIATION_TEMPLATES: Dict[str, Dict[str, Any]] = {
         "safe_alternative": "autoescape=True",
         "import_required": None,
         "auto_fixable": True,
+        "tier": "needs_review",
         "replacement_pattern": "Environment(..., autoescape=True)",
         "description": "Enable autoescape in Jinja2 environment.",
+    },
+
+    # Non-auto-fixable guidance templates
+    "B102": {
+        "safe_alternative": None,
+        "import_required": None,
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": None,
+        "description": "Refactor dynamic exec() to explicit function or dispatch table.",
+    },
+    "B306": {
+        "safe_alternative": "tempfile.NamedTemporaryFile",
+        "import_required": "tempfile",
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": None,
+        "description": "Replace insecure tempfile.mktemp() with tempfile.NamedTemporaryFile() or mkstemp().",
+    },
+    "B307": {
+        "safe_alternative": "ast.literal_eval",
+        "import_required": "ast",
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": "ast.literal_eval({arg})",
+        "description": "Replace eval() with ast.literal_eval() for literal evaluation.",
+    },
+    "B324": {
+        "safe_alternative": "usedforsecurity=False",
+        "import_required": None,
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": "hashlib.new(..., usedforsecurity=False)",
+        "description": "Specify usedforsecurity=False for non-cryptographic hashing (suppresses warning).",
+    },
+    "B602": {
+        "safe_alternative": "shell=False",
+        "import_required": "shlex",
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": "subprocess.run(shlex.split({cmd}), shell=False)",
+        "description": "Pass arguments as a list and set shell=False.",
+    },
+    "B604": {
+        "safe_alternative": "shell=False",
+        "import_required": None,
+        "auto_fixable": False,
+        "tier": "manual",
+        "replacement_pattern": "func(..., shell=False)",
+        "description": "Pass arguments as a list and set shell=False.",
     },
 }
 
 
-def get_remediation_metadata(test_id: Optional[str]) -> Dict[str, Any]:
-    """Return structured remediation guidance for a Bandit test_id."""
+def get_remediation_metadata(test_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return structured remediation guidance for a Bandit test_id, or None if unmapped."""
     t_id = test_id.upper() if test_id else "UNKNOWN"
     if t_id in REMEDIATION_TEMPLATES:
         return dict(REMEDIATION_TEMPLATES[t_id])
-    hint = COMMON_FIX_HINTS.get(
-        t_id,
-        f"Review Bandit rule {t_id} and refactor the code to eliminate this pattern.",
-    )
-    return {
-        "safe_alternative": None,
-        "import_required": None,
-        "auto_fixable": False,
-        "replacement_pattern": None,
-        "description": hint,
-    }
-
-
-def patch_code_snippet(code: str, test_id: str) -> Optional[str]:
-    """Generate an automated code fix for known auto-fixable Bandit rules.
-
-    Returns the patched string if a transformation is applied, or None if no fix applies.
-    """
-    t_id = test_id.upper() if test_id else ""
-    if not code or not t_id:
-        return None
-
-    patched = code
-    if t_id == "B506":
-        # yaml.load(...) -> yaml.safe_load(...)
-        if "yaml.load" in patched:
-            patched = re.sub(r"\byaml\.load\s*\(", "yaml.safe_load(", patched)
-            patched = re.sub(r",\s*Loader\s*=\s*yaml\.[A-Za-z0-9_]+", "", patched)
-    elif t_id == "B303":
-        # hashlib.md5 / sha1 -> hashlib.sha256
-        patched = re.sub(r"\bhashlib\.(?:md5|sha1)\s*\(", "hashlib.sha256(", patched)
-        patched = re.sub(r"\b(?:Crypto\.Hash\.)?MD5\.new\s*\(", "Crypto.Hash.SHA256.new(", patched)
-    elif t_id == "B201":
-        # app.run(..., debug=True) -> app.run(..., debug=False)
-        patched = re.sub(r"\bdebug\s*=\s*True\b", "debug=False", patched)
-    elif t_id == "B306":
-        # tempfile.mktemp() -> tempfile.NamedTemporaryFile()
-        patched = re.sub(r"\btempfile\.mktemp\s*\(", "tempfile.NamedTemporaryFile(", patched)
-        patched = re.sub(r"(?<!tempfile\.)\bmktemp\s*\(", "tempfile.NamedTemporaryFile(", patched)
-    elif t_id == "B113":
-        # Add timeout=10 to requests calls missing a timeout
-        if "timeout" not in patched:
-            pattern = re.compile(
-                r"\b((?:requests|session)\.(?:get|post|put|delete|patch|head|options|request))\((.*?)\)",
-                re.DOTALL,
-            )
-            def _add_timeout(m: re.Match) -> str:
-                call_name = m.group(1)
-                args = m.group(2).strip()
-                if not args:
-                    return f"{call_name}(timeout=10)"
-                return f"{call_name}({args}, timeout=10)"
-            patched = pattern.sub(_add_timeout, patched)
-    elif t_id == "B501":
-        # verify=False -> verify=True
-        patched = re.sub(r"\bverify\s*=\s*False\b", "verify=True", patched)
-    elif t_id == "B604":
-        # shell=True -> shell=False
-        patched = re.sub(r"\bshell\s*=\s*True\b", "shell=False", patched)
-    elif t_id == "B614":
-        # torch.load(..., weights_only=True)
-        if "weights_only" not in patched and "torch.load" in patched:
-            patched = re.sub(r"\btorch\.load\((.*?)\)", r"torch.load(\1, weights_only=True)", patched)
-    elif t_id == "B701":
-        # autoescape=False -> autoescape=True
-        patched = re.sub(r"\bautoescape\s*=\s*False\b", "autoescape=True", patched)
-
-    return patched if patched != code else None
+    return None
 
 SKIP_DIRS = {".git", ".hg", "venv", ".venv", "node_modules", "__pycache__", ".tox"}
 
@@ -618,7 +565,7 @@ class BanditEngine(Engine):
         # Exploitability heuristic based on rule calibration and confidence
         exploitability = _calculate_exploitability(issue_sev, issue_conf, test_id=test_id)
 
-        # Fix hint & structured remediation metadata (Step 9 Integration)
+        # Fix hint
         fix_hint = COMMON_FIX_HINTS.get(
             test_id,
             f"Review Bandit rule {test_id} ({r.get('more_info', '')}) and refactor the code to eliminate this pattern.",
@@ -627,6 +574,19 @@ class BanditEngine(Engine):
 
         # Evidence
         code_snippet = (r.get("code") or "").strip()
+
+        extra_dict = {
+            "test_id": test_id,
+            "test_name": test_name,
+            "issue_severity": issue_sev,
+            "issue_confidence": issue_conf,
+            "line_range": r.get("line_range", []),
+            "col_offset": r.get("col_offset"),
+            "end_col_offset": r.get("end_col_offset"),
+            "more_info": r.get("more_info", ""),
+        }
+        if remediation_meta is not None:
+            extra_dict["remediation"] = remediation_meta
 
         return redact_finding(Finding(
             engine=self.name,
@@ -639,15 +599,5 @@ class BanditEngine(Engine):
             evidence=code_snippet,
             fix_hint=fix_hint,
             exploitability=exploitability,
-            extra={
-                "test_id": test_id,
-                "test_name": test_name,
-                "issue_severity": issue_sev,
-                "issue_confidence": issue_conf,
-                "line_range": r.get("line_range", []),
-                "col_offset": r.get("col_offset"),
-                "end_col_offset": r.get("end_col_offset"),
-                "more_info": r.get("more_info", ""),
-                "remediation": remediation_meta,
-            },
+            extra=extra_dict,
         ))

@@ -16,7 +16,6 @@ from engines.bandit_engine import (
     COMMON_FIX_HINTS,
     REMEDIATION_TEMPLATES,
     get_remediation_metadata,
-    patch_code_snippet,
     _calculate_severity,
     _calculate_exploitability,
     _rel_path,
@@ -314,12 +313,11 @@ def test_bandit_repo_with_python_in_env_dir_not_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Phase 4 Unit tests: Remediation Hints & Automated Patch Guidance
+# Remediation Hints & Guidance Tests
 # --------------------------------------------------------------------------- #
 def test_common_fix_hints_key_parity():
-    """Verify that COMMON_FIX_HINTS has 100% key parity with BANDIT_RULE_CALIBRATION (all 79 rules)."""
+    """Verify that COMMON_FIX_HINTS has 100% key parity with BANDIT_RULE_CALIBRATION."""
     assert set(COMMON_FIX_HINTS.keys()) == set(BANDIT_RULE_CALIBRATION.keys())
-    assert len(COMMON_FIX_HINTS) >= 79
     for test_id, hint in COMMON_FIX_HINTS.items():
         assert isinstance(hint, str)
         assert len(hint.strip()) > 15, f"Fix hint for {test_id} is too short: {hint!r}"
@@ -327,77 +325,31 @@ def test_common_fix_hints_key_parity():
 
 def test_remediation_metadata_structure():
     """Verify structured remediation metadata format and auto_fixable status."""
-    # Top 5 Auto-Fixable Rules
-    for auto_id in ["B506", "B303", "B201", "B306", "B113"]:
+    for auto_id in ["B201", "B113", "B506", "B303", "B501", "B614", "B701"]:
         meta = get_remediation_metadata(auto_id)
+        assert meta is not None
         assert meta["auto_fixable"] is True
         assert meta["safe_alternative"] is not None
-        assert meta["replacement_pattern"] is not None
+        assert meta["tier"] in {"mechanical", "needs_review"}
         assert meta["description"]
 
-    # Non-auto-fixable rule with structured alternative
-    exec_meta = get_remediation_metadata("B102")
-    assert exec_meta["auto_fixable"] is False
-    assert exec_meta["safe_alternative"] == "ast.literal_eval"
+    # Non-auto-fixable rules
+    for non_auto in ["B102", "B306", "B307", "B324", "B602", "B604"]:
+        meta = get_remediation_metadata(non_auto)
+        assert meta is not None
+        assert meta["auto_fixable"] is False
+        assert meta["tier"] == "manual"
 
-    # Unknown rule fallback
-    fallback_meta = get_remediation_metadata("B999")
-    assert fallback_meta["auto_fixable"] is False
-    assert fallback_meta["safe_alternative"] is None
-    assert "B999" in fallback_meta["description"]
-
-
-def test_patch_code_snippet_top_5_patterns():
-    """Verify code snippet patching for top 5 Bandit findings."""
-    # 1. B506: yaml.load -> yaml.safe_load
-    b506_in = "data = yaml.load(stream, Loader=yaml.Loader)"
-    assert patch_code_snippet(b506_in, "B506") == "data = yaml.safe_load(stream)"
-
-    b506_simple = "doc = yaml.load(f.read())"
-    assert patch_code_snippet(b506_simple, "B506") == "doc = yaml.safe_load(f.read())"
-
-    # 2. B303: hashlib.md5 / sha1 -> hashlib.sha256
-    b303_md5 = 'token_hash = hashlib.md5(secret).hexdigest()'
-    assert patch_code_snippet(b303_md5, "B303") == 'token_hash = hashlib.sha256(secret).hexdigest()'
-
-    b303_sha1 = 'digest = hashlib.sha1(payload).digest()'
-    assert patch_code_snippet(b303_sha1, "B303") == 'digest = hashlib.sha256(payload).digest()'
-
-    # 3. B201: debug=True -> debug=False
-    b201_in = 'app.run(host="0.0.0.0", port=5000, debug=True)'
-    assert patch_code_snippet(b201_in, "B201") == 'app.run(host="0.0.0.0", port=5000, debug=False)'
-
-    # 4. B306: tempfile.mktemp() -> tempfile.NamedTemporaryFile()
-    b306_in = 'tmp = tempfile.mktemp(suffix=".txt")'
-    assert patch_code_snippet(b306_in, "B306") == 'tmp = tempfile.NamedTemporaryFile(suffix=".txt")'
-
-    # 5. B113: requests call without timeout -> requests call with timeout=10
-    b113_get = 'resp = requests.get("https://api.example.com/v1")'
-    assert patch_code_snippet(b113_get, "B113") == 'resp = requests.get("https://api.example.com/v1", timeout=10)'
-
-    b113_post = 'resp = requests.post(url, data=payload, headers=hdr)'
-    assert patch_code_snippet(b113_post, "B113") == 'resp = requests.post(url, data=payload, headers=hdr, timeout=10)'
-
-    # Additional auto-fix rules
-    # B501: verify=False -> verify=True
-    assert patch_code_snippet('requests.get(url, verify=False)', "B501") == 'requests.get(url, verify=True)'
-
-    # B604: shell=True -> shell=False
-    assert patch_code_snippet('subprocess.call(cmd, shell=True)', "B604") == 'subprocess.call(cmd, shell=False)'
-
-    # B701: autoescape=False -> autoescape=True
-    assert patch_code_snippet('Environment(autoescape=False)', "B701") == 'Environment(autoescape=True)'
+    # Unmapped rules return None (not attached to finding extra to avoid duplication)
+    assert get_remediation_metadata("B999") is None
+    assert get_remediation_metadata("B101") is None
 
 
-def test_patch_code_snippet_no_op():
-    """Verify that patch_code_snippet returns None when no fix is needed or applicable."""
-    # Already safe requests call with timeout
-    assert patch_code_snippet('resp = requests.get(url, timeout=5)', "B113") is None
+def test_remediation_templates_parity_with_rule_patchers():
+    """Verify that REMEDIATION_TEMPLATES auto_fixable set matches RULE_PATCHERS exactly."""
+    from remediation.code_patcher import RULE_PATCHERS
 
-    # Already safe yaml.safe_load
-    assert patch_code_snippet('data = yaml.safe_load(f)', "B506") is None
+    auto_fixable_templates = {k for k, v in REMEDIATION_TEMPLATES.items() if v.get("auto_fixable")}
+    assert auto_fixable_templates == set(RULE_PATCHERS.keys())
 
-    # Unsupported or non-auto-fixable rule
-    assert patch_code_snippet('eval(user_input)', "B307") is None
-    assert patch_code_snippet('', "B506") is None
 
