@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.finding import Finding
 from core.redact import redact_finding
@@ -32,108 +32,106 @@ TIMEOUT = 60
 SEV_MAP = {"HIGH": 8.0, "MEDIUM": 5.0, "LOW": 2.5}
 CONF_ADJUST = {"HIGH": 0.5, "MEDIUM": 0.0, "LOW": -0.5}
 
-# Calibrated vulnerability base severities (1.0 - 10.0 scale)
-RULE_SEVERITY_BASE: Dict[str, float] = {
-    # RCE & Eval / Command Injection (Critical impact 8.8 - 9.5)
-    "B102": 9.2,  # exec_used
-    "B307": 9.2,  # eval
-    "B506": 9.0,  # yaml_load (arbitrary object creation / RCE)
-    "B602": 9.0,  # subprocess shell=True
-    "B605": 8.8,  # start_process_with_a_shell
-    "B609": 8.5,  # wildcard injection
-    "B601": 8.5,  # paramiko calls
-    "B612": 9.0,  # logging listen pickle RCE
-    "B614": 8.8,  # pytorch_load weights RCE
-    "B615": 8.8,  # huggingface unsafe download
-    "B301": 8.5,  # pickle deserialization
-    "B302": 8.5,  # marshal deserialization
-    "B403": 7.5,  # import pickle
-    "B404": 7.5,  # import subprocess
-    # Passwords & Hardcoded Secrets (2.5 base matching Bandit LOW severity)
-    "B105": 2.5, "B106": 2.5, "B107": 2.5,
-    # SQL Injection (8.5 base)
-    "B608": 8.5, "B610": 8.5, "B611": 8.5,
-    # XXE (8.0 base)
-    "B313": 8.0, "B314": 8.0, "B315": 8.0, "B316": 8.0,
-    "B317": 8.0, "B318": 8.0, "B319": 8.0, "B320": 8.0,
-    # Dangerous Web Settings & Path Traversal (6.8 - 7.5)
-    "B201": 7.5,  # flask debug=True (Werkzeug debugger console)
-    "B202": 7.5,  # tarfile path traversal
-    "B308": 6.8,  # django mark_safe (XSS)
-    "B701": 6.8,  # jinja2 autoescape false (XSS)
-    "B702": 6.8,  # mako templates (XSS)
-    "B703": 6.8,  # django mark_safe (XSS)
-    "B704": 6.8,  # markupsafe markup XSS
-    "B310": 7.5,  # urllib urlopen SSRF / file scheme
-    # Broken Cryptography & Insecure Hashes (6.5 - 8.0)
-    "B303": 8.0,  # md5 / sha1 (High base)
-    "B324": 7.5,  # hashlib insecure functions
-    "B304": 7.5,  # weak ciphers (DES, ARC4)
-    "B305": 6.5,  # weak cipher mode (ECB)
-    "B501": 6.5,  # verify=False
-    "B502": 6.5, "B503": 6.5, "B504": 6.5, "B505": 6.5,
-    "B309": 6.5, "B323": 6.5, "B507": 6.5,
-    # Network Bindings, Cleartext & Weak Randomness (4.0 - 5.5)
-    "B104": 4.5,  # bind 0.0.0.0
-    "B311": 4.0,  # pseudo-random generator
-    "B312": 5.5,  # telnetlib
-    "B321": 5.5,  # ftplib
-    "B508": 5.0,  # snmp insecure version
-    # Temporary files & race conditions (4.5 - 5.5)
-    "B108": 4.5,  # hardcoded tmp directory
-    "B306": 5.0,  # mktemp race condition
-    "B325": 5.0,  # tempnam race condition
-    "B103": 5.0,  # bad file permissions
-    # Hygiene & Timeouts (2.5 - 4.0)
-    "B113": 4.0,  # request without timeout
-    "B101": 2.5,  # assert used
-    "B110": 2.5,  # try_except_pass
-    "B112": 2.5,  # try_except_continue
-    "B603": 3.0,  # subprocess without shell=True
-    "B606": 3.0,  # process no shell
-    "B607": 3.5,  # partial path
+# Unified rule calibration table: (base_severity, base_exploitability)
+# Systematically covers all 79 rules in core.taxonomy.BANDIT_TO_CWE.
+BANDIT_RULE_CALIBRATION: Dict[str, Tuple[float, float]] = {
+    # B1xx: General & Code Hygiene
+    "B101": (2.0, 0.10),   # assert_used
+    "B102": (8.5, 0.80),   # exec_used
+    "B103": (4.5, 0.30),   # set_bad_file_permissions
+    "B104": (4.5, 0.40),   # hardcoded_bind_all_interfaces
+    "B105": (2.5, 0.30),   # hardcoded_password_string (Bandit regex noise level)
+    "B106": (2.5, 0.30),   # hardcoded_password_funcarg
+    "B107": (2.5, 0.30),   # hardcoded_password_default
+    "B108": (4.0, 0.25),   # hardcoded_tmp_directory
+    "B110": (2.0, 0.10),   # try_except_pass
+    "B112": (2.0, 0.10),   # try_except_continue
+    "B113": (3.5, 0.20),   # request_without_timeout
+
+    # B2xx: Web & Frameworks
+    "B201": (7.5, 0.65),   # flask_debug_true
+    "B202": (7.0, 0.60),   # tarfile_unsafe_members
+
+    # B3xx: Blacklist Calls & Insecure Functions
+    "B301": (8.0, 0.70),   # pickle deserialization
+    "B302": (8.0, 0.70),   # marshal deserialization
+    "B303": (6.5, 0.30),   # md5/sha1 hash (calibrated for non-security checksums)
+    "B304": (7.0, 0.45),   # ciphers (DES, ARC4)
+    "B305": (6.5, 0.40),   # cipher_modes (ECB)
+    "B306": (4.5, 0.30),   # mktemp_q
+    "B307": (8.5, 0.80),   # eval
+    "B308": (6.5, 0.55),   # django mark_safe (XSS)
+    "B309": (6.5, 0.50),   # httpsconnection
+    "B310": (7.0, 0.60),   # urllib_urlopen (SSRF)
+    "B311": (3.5, 0.20),   # random pseudo-random generator
+    "B312": (5.0, 0.40),   # telnetlib
+    "B313": (7.5, 0.55),   # xml_bad_cElementTree (XXE)
+    "B314": (7.5, 0.55),   # xml_bad_ElementTree (XXE)
+    "B315": (7.5, 0.55),   # xml_bad_expatreader (XXE)
+    "B316": (7.5, 0.55),   # xml_bad_expatbuilder (XXE)
+    "B317": (7.5, 0.55),   # xml_bad_sax (XXE)
+    "B318": (7.5, 0.55),   # xml_bad_minidom (XXE)
+    "B319": (7.5, 0.55),   # xml_bad_pulldom (XXE)
+    "B320": (7.5, 0.55),   # xml_bad_etree (XXE)
+    "B321": (5.0, 0.40),   # ftplib
+    "B323": (6.5, 0.50),   # unverified_context
+    "B324": (6.5, 0.30),   # hashlib_new_insecure_functions
+    "B325": (4.5, 0.30),   # tempnam
+
+    # B4xx: Blacklist Imports (bare imports: low severity, strictly below call rules)
+    "B401": (2.5, 0.10),   # import_telnetlib
+    "B402": (2.5, 0.10),   # import_ftplib
+    "B403": (2.5, 0.10),   # import_pickle
+    "B404": (2.5, 0.10),   # import_subprocess
+    "B405": (2.5, 0.10),   # import_xml_etree
+    "B406": (2.5, 0.10),   # import_xml_sax
+    "B407": (2.5, 0.10),   # import_xml_expat
+    "B408": (2.5, 0.10),   # import_xml_minidom
+    "B409": (2.5, 0.10),   # import_xml_pulldom
+    "B410": (2.5, 0.10),   # import_lxml
+    "B411": (2.5, 0.10),   # import_xmlrpc
+    "B412": (2.5, 0.10),   # import_httpoxy
+    "B413": (2.5, 0.10),   # import_pycrypto
+    "B415": (2.5, 0.10),   # import_pyghmi
+
+    # B5xx: Cryptography & SSL/TLS Configuration
+    "B501": (6.5, 0.50),   # request_with_no_cert_validation
+    "B502": (6.0, 0.40),   # ssl_with_bad_version
+    "B503": (6.0, 0.40),   # ssl_with_bad_defaults
+    "B504": (6.0, 0.40),   # ssl_with_no_version
+    "B505": (6.0, 0.40),   # weak_cryptographic_key
+    "B506": (8.0, 0.75),   # yaml_load (calibrated: pattern vs data flow)
+    "B507": (6.5, 0.50),   # ssh_no_host_key_verification
+    "B508": (4.5, 0.35),   # snmp_insecure_version
+    "B509": (5.0, 0.35),   # snmp_weak_cryptography
+
+    # B6xx: Command, Process & SQL Injection
+    "B601": (7.5, 0.65),   # paramiko_calls
+    "B602": (8.5, 0.75),   # subprocess_popen_with_shell_equals_true
+    "B603": (3.0, 0.15),   # subprocess_without_shell_equals_true
+    "B604": (8.0, 0.70),   # any_other_function_with_shell_equals_true
+    "B605": (8.0, 0.70),   # start_process_with_a_shell
+    "B606": (3.0, 0.15),   # start_process_no_shell
+    "B607": (3.5, 0.20),   # start_process_with_partial_path
+    "B608": (8.5, 0.75),   # hardcoded_sql_expressions
+    "B609": (7.5, 0.65),   # linux_commands_wildcard_injection
+    "B610": (8.5, 0.75),   # django_extra_used
+    "B611": (8.5, 0.75),   # django_rawsql_used
+    "B612": (7.0, 0.55),   # logging_config_insecure_listen (reachable port dependent)
+    "B613": (6.0, 0.40),   # trojansource
+    "B614": (8.0, 0.70),   # pytorch_load
+    "B615": (5.5, 0.30),   # huggingface_unsafe_download (supply-chain risk)
+
+    # B7xx: Template Injection & XSS
+    "B701": (6.5, 0.55),   # jinja2_autoescape_false
+    "B702": (6.5, 0.55),   # use_of_mako_templates
+    "B703": (6.5, 0.55),   # django_mark_safe
+    "B704": (6.5, 0.55),   # markupsafe_markup_xss
 }
 
-# Calibrated vulnerability exploitability baseline (0.05 - 1.0 scale)
-RULE_EXPLOIT_BASE: Dict[str, float] = {
-    # RCE / Code Execution (0.80 - 0.88)
-    "B102": 0.88,  # exec
-    "B307": 0.88,  # eval
-    "B506": 0.85,  # yaml.load
-    "B602": 0.85,  # subprocess shell=True
-    "B605": 0.80,  # system shell
-    "B609": 0.75,  # wildcard injection
-    "B301": 0.80,  # pickle
-    "B302": 0.80,  # marshal
-    "B612": 0.85,  # logging listen
-    "B614": 0.80,  # pytorch load
-    "B615": 0.80,  # huggingface download
-    # SQL Injection (0.80)
-    "B608": 0.80, "B610": 0.80, "B611": 0.80,
-    # Debuggers & Web Configuration (0.65 - 0.70)
-    "B201": 0.70,  # flask debug=True
-    "B202": 0.65,  # tarfile path traversal
-    "B308": 0.60, "B701": 0.60, "B702": 0.60, "B703": 0.60, "B704": 0.60,  # XSS
-    "B310": 0.65,  # SSRF
-    # Secrets & Hardcoded Passwords (0.60)
-    "B105": 0.60, "B106": 0.60, "B107": 0.60,
-    # XXE (0.55)
-    "B313": 0.55, "B314": 0.55, "B315": 0.55, "B316": 0.55,
-    "B317": 0.55, "B318": 0.55, "B319": 0.55, "B320": 0.55,
-    # Network & Cleartext (0.40 - 0.50)
-    "B104": 0.45,  # 0.0.0.0 bind
-    "B312": 0.50, "B321": 0.50, "B508": 0.45,
-    # Broken Crypto & Hashes (0.35 - 0.45)
-    "B303": 0.35, "B324": 0.35,  # md5/sha1
-    "B304": 0.45, "B305": 0.40,
-    "B501": 0.50, "B502": 0.45, "B503": 0.45, "B504": 0.45, "B505": 0.45,
-    # Temp files & Hygiene (0.20 - 0.30)
-    "B108": 0.30, "B306": 0.35, "B325": 0.35,
-    "B311": 0.20,  # pseudo-random
-    "B113": 0.25,  # timeout
-    "B101": 0.10, "B110": 0.10, "B112": 0.10,
-    "B603": 0.15, "B606": 0.15, "B607": 0.20,
-}
+# Synchronized derived views guaranteeing key parity
+RULE_SEVERITY_BASE: Dict[str, float] = {k: v[0] for k, v in BANDIT_RULE_CALIBRATION.items()}
+RULE_EXPLOIT_BASE: Dict[str, float] = {k: v[1] for k, v in BANDIT_RULE_CALIBRATION.items()}
 
 COMMON_FIX_HINTS: Dict[str, str] = {
     "B506": "Use yaml.safe_load() instead of yaml.load() to prevent arbitrary code execution.",
@@ -158,11 +156,12 @@ def _calculate_severity(
     issue_conf: str,
     test_id: Optional[str] = None,
 ) -> float:
-    if test_id and test_id.upper() in RULE_SEVERITY_BASE:
-        base = RULE_SEVERITY_BASE[test_id.upper()]
+    t_id = test_id.upper() if test_id else None
+    if t_id and t_id in RULE_SEVERITY_BASE:
+        base = RULE_SEVERITY_BASE[t_id]
     else:
-        base = SEV_MAP.get(issue_sev.upper(), 5.0)
-    adjust = CONF_ADJUST.get(issue_conf.upper(), 0.0)
+        base = SEV_MAP.get((issue_sev or "").upper(), 5.0)
+    adjust = CONF_ADJUST.get((issue_conf or "").upper(), 0.0)
     return round(max(1.0, min(10.0, base + adjust)), 1)
 
 
@@ -171,11 +170,12 @@ def _calculate_exploitability(
     issue_conf: str,
     test_id: Optional[str] = None,
 ) -> float:
-    if test_id and test_id.upper() in RULE_EXPLOIT_BASE:
-        base = RULE_EXPLOIT_BASE[test_id.upper()]
+    t_id = test_id.upper() if test_id else None
+    if t_id and t_id in RULE_EXPLOIT_BASE:
+        base = RULE_EXPLOIT_BASE[t_id]
     else:
-        base = {"HIGH": 0.7, "MEDIUM": 0.4, "LOW": 0.15}.get(issue_sev.upper(), 0.3)
-    conf_mult = {"HIGH": 1.0, "MEDIUM": 0.8, "LOW": 0.5}.get(issue_conf.upper(), 0.7)
+        base = {"HIGH": 0.7, "MEDIUM": 0.4, "LOW": 0.15}.get((issue_sev or "").upper(), 0.3)
+    conf_mult = {"HIGH": 1.0, "MEDIUM": 0.8, "LOW": 0.5}.get((issue_conf or "").upper(), 0.7)
     return round(max(0.05, min(1.0, base * conf_mult)), 2)
 
 

@@ -7,8 +7,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.finding import Finding
+from core.taxonomy import BANDIT_TO_CWE
 from engines.bandit_engine import (
     BanditEngine,
+    BANDIT_RULE_CALIBRATION,
+    RULE_SEVERITY_BASE,
+    RULE_EXPLOIT_BASE,
     _calculate_severity,
     _calculate_exploitability,
     _rel_path,
@@ -91,19 +95,19 @@ def test_parse_canned_bandit_output(tmp_path):
     findings = engine._parse_output(raw_stdout, tmp_path)
 
     assert len(findings) == 2
-    # B506 (arbitrary code execution) is prioritized above B303 (weak hash)
+    # B506 (yaml.load code execution, sev 8.5) is prioritized above B303 (md5 hash, sev 7.0)
     assert findings[0].file == "app.py"
     assert findings[0].cwe == "CWE-502"
-    assert findings[0].severity == 9.5
-    assert findings[0].exploitability == 0.85
+    assert findings[0].severity == 8.5
+    assert findings[0].exploitability == 0.75
     assert "yaml.safe_load" in findings[0].fix_hint
 
     assert findings[1].engine == "bandit"
     assert findings[1].file == "crypto.py"
     assert findings[1].line == 15
     assert findings[1].cwe == "CWE-327"
-    assert findings[1].severity == 8.5
-    assert findings[1].exploitability == 0.35
+    assert findings[1].severity == 7.0
+    assert findings[1].exploitability == 0.30
     assert "B303" in findings[1].title
     assert "hashlib.sha256" in findings[1].fix_hint
     assert engine.stats["findings_count"] == 2
@@ -112,18 +116,65 @@ def test_parse_canned_bandit_output(tmp_path):
 @pytest.mark.parametrize(
     "sev,conf,test_id,expected_sev,expected_exploit",
     [
-        ("MEDIUM", "HIGH", "B506", 9.5, 0.85),   # yaml_load: RCE elevated from 5.5 to 9.5
-        ("HIGH", "HIGH", "B102", 9.7, 0.88),     # exec: critical RCE
-        ("HIGH", "HIGH", "B602", 9.5, 0.85),     # subprocess shell=True
-        ("MEDIUM", "HIGH", "B608", 9.0, 0.80),   # SQL injection
-        ("LOW", "HIGH", "B113", 4.5, 0.25),      # timeout: low severity
-        ("LOW", "MEDIUM", "B108", 4.5, 0.24),    # tmp directory
-        ("MEDIUM", "LOW", "B506", 8.5, 0.42),    # low confidence damping
+        ("MEDIUM", "HIGH", "B506", 8.5, 0.75),   # yaml_load: calibrated RCE
+        ("HIGH", "HIGH", "B102", 9.0, 0.80),     # exec: critical RCE
+        ("HIGH", "HIGH", "B602", 9.0, 0.75),     # subprocess shell=True
+        ("MEDIUM", "HIGH", "B608", 9.0, 0.75),   # SQL injection
+        ("LOW", "HIGH", "B113", 4.0, 0.20),      # timeout: low severity
+        ("LOW", "MEDIUM", "B108", 4.0, 0.20),    # tmp directory
+        ("LOW", "HIGH", "B403", 3.0, 0.10),      # bare import pickle: low severity
+        ("LOW", "HIGH", "B404", 3.0, 0.10),      # bare import subprocess: low severity
     ],
 )
 def test_calibrated_severity_and_exploitability(sev, conf, test_id, expected_sev, expected_exploit):
     assert _calculate_severity(sev, conf, test_id=test_id) == expected_sev
     assert _calculate_exploitability(sev, conf, test_id=test_id) == expected_exploit
+
+
+def test_bandit_rule_calibration_key_sets_match():
+    """Verify that RULE_SEVERITY_BASE, RULE_EXPLOIT_BASE, and BANDIT_TO_CWE have 100% key parity."""
+    assert set(RULE_SEVERITY_BASE.keys()) == set(RULE_EXPLOIT_BASE.keys())
+    assert set(RULE_SEVERITY_BASE.keys()) == set(BANDIT_TO_CWE.keys())
+    assert len(BANDIT_RULE_CALIBRATION) >= 75
+
+
+def test_import_rules_score_below_call_rules():
+    """Verify that bare import rules (B4xx) always score strictly below call rules in the same family."""
+    # Pickle: import (B403) vs call (B301)
+    assert RULE_SEVERITY_BASE["B403"] < RULE_SEVERITY_BASE["B301"]
+    assert RULE_EXPLOIT_BASE["B403"] < RULE_EXPLOIT_BASE["B301"]
+    # Subprocess: import (B404) vs shell=True (B602)
+    assert RULE_SEVERITY_BASE["B404"] < RULE_SEVERITY_BASE["B602"]
+    assert RULE_EXPLOIT_BASE["B404"] < RULE_EXPLOIT_BASE["B602"]
+    # XML: import (B405) vs parser call (B314)
+    assert RULE_SEVERITY_BASE["B405"] < RULE_SEVERITY_BASE["B314"]
+    assert RULE_EXPLOIT_BASE["B405"] < RULE_EXPLOIT_BASE["B314"]
+    # Telnet: import (B401) vs call (B312)
+    assert RULE_SEVERITY_BASE["B401"] < RULE_SEVERITY_BASE["B312"]
+    assert RULE_EXPLOIT_BASE["B401"] < RULE_EXPLOIT_BASE["B312"]
+
+
+def test_calculate_severity_and_exploitability_unknown_fallback():
+    """Verify that unknown rule IDs gracefully fall back to generic severity/exploitability."""
+    # Unknown rule ID fallback
+    assert _calculate_severity("HIGH", "HIGH", test_id="B999") == 8.5
+    assert _calculate_severity("MEDIUM", "MEDIUM", test_id=None) == 5.0
+    assert _calculate_exploitability("HIGH", "HIGH", test_id="B999") == 0.70
+    assert _calculate_exploitability("LOW", "LOW", test_id=None) == pytest.approx(0.08, abs=0.01)
+
+
+def test_calculate_severity_and_exploitability_case_insensitivity():
+    """Verify that test IDs and severity/confidence levels are case-insensitive."""
+    assert _calculate_severity("medium", "high", test_id="b506") == _calculate_severity("MEDIUM", "HIGH", test_id="B506")
+    assert _calculate_exploitability("medium", "high", test_id="b506") == _calculate_exploitability("MEDIUM", "HIGH", test_id="B506")
+
+
+def test_calculate_severity_and_exploitability_clamping():
+    """Verify that outputs stay bounded in [1.0, 10.0] for severity and [0.05, 1.0] for exploitability."""
+    assert 1.0 <= _calculate_severity("LOW", "LOW", test_id="B101") <= 10.0
+    assert 1.0 <= _calculate_severity("HIGH", "HIGH", test_id="B102") <= 10.0
+    assert 0.05 <= _calculate_exploitability("LOW", "LOW", test_id="B101") <= 1.0
+    assert 0.05 <= _calculate_exploitability("HIGH", "HIGH", test_id="B102") <= 1.0
 
 
 def test_bandit_empty_output(tmp_path):
