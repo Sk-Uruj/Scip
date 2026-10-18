@@ -13,6 +13,10 @@ from engines.bandit_engine import (
     BANDIT_RULE_CALIBRATION,
     RULE_SEVERITY_BASE,
     RULE_EXPLOIT_BASE,
+    COMMON_FIX_HINTS,
+    REMEDIATION_TEMPLATES,
+    get_remediation_metadata,
+    patch_code_snippet,
     _calculate_severity,
     _calculate_exploitability,
     _rel_path,
@@ -101,6 +105,9 @@ def test_parse_canned_bandit_output(tmp_path):
     assert findings[0].severity == 8.5
     assert findings[0].exploitability == 0.75
     assert "yaml.safe_load" in findings[0].fix_hint
+    assert findings[0].extra["remediation"]["auto_fixable"] is True
+    assert findings[0].extra["remediation"]["safe_alternative"] == "yaml.safe_load"
+    assert "yaml.safe_load" in findings[0].extra["remediation"]["replacement_pattern"]
 
     assert findings[1].engine == "bandit"
     assert findings[1].file == "crypto.py"
@@ -110,6 +117,8 @@ def test_parse_canned_bandit_output(tmp_path):
     assert findings[1].exploitability == 0.30
     assert "B303" in findings[1].title
     assert "hashlib.sha256" in findings[1].fix_hint
+    assert findings[1].extra["remediation"]["auto_fixable"] is True
+    assert findings[1].extra["remediation"]["safe_alternative"] == "hashlib.sha256"
     assert engine.stats["findings_count"] == 2
 
 
@@ -117,6 +126,7 @@ def test_parse_canned_bandit_output(tmp_path):
     "sev,conf,test_id,expected_sev,expected_exploit",
     [
         ("MEDIUM", "HIGH", "B506", 8.5, 0.75),   # yaml_load: calibrated RCE
+        ("MEDIUM", "LOW", "B506", 7.5, 0.38),    # yaml_load: low confidence damping (negative CONF_ADJUST and 0.5 factor)
         ("HIGH", "HIGH", "B102", 9.0, 0.80),     # exec: critical RCE
         ("HIGH", "HIGH", "B602", 9.0, 0.75),     # subprocess shell=True
         ("MEDIUM", "HIGH", "B608", 9.0, 0.75),   # SQL injection
@@ -301,3 +311,93 @@ def test_bandit_repo_with_python_in_env_dir_not_skipped(tmp_path):
     engine = BanditEngine()
     # env/ is not a virtualenv exclude directory; files under env/ must be detected
     assert engine._has_python_files(repo_dir) is True
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4 Unit tests: Remediation Hints & Automated Patch Guidance
+# --------------------------------------------------------------------------- #
+def test_common_fix_hints_key_parity():
+    """Verify that COMMON_FIX_HINTS has 100% key parity with BANDIT_RULE_CALIBRATION (all 79 rules)."""
+    assert set(COMMON_FIX_HINTS.keys()) == set(BANDIT_RULE_CALIBRATION.keys())
+    assert len(COMMON_FIX_HINTS) >= 79
+    for test_id, hint in COMMON_FIX_HINTS.items():
+        assert isinstance(hint, str)
+        assert len(hint.strip()) > 15, f"Fix hint for {test_id} is too short: {hint!r}"
+
+
+def test_remediation_metadata_structure():
+    """Verify structured remediation metadata format and auto_fixable status."""
+    # Top 5 Auto-Fixable Rules
+    for auto_id in ["B506", "B303", "B201", "B306", "B113"]:
+        meta = get_remediation_metadata(auto_id)
+        assert meta["auto_fixable"] is True
+        assert meta["safe_alternative"] is not None
+        assert meta["replacement_pattern"] is not None
+        assert meta["description"]
+
+    # Non-auto-fixable rule with structured alternative
+    exec_meta = get_remediation_metadata("B102")
+    assert exec_meta["auto_fixable"] is False
+    assert exec_meta["safe_alternative"] == "ast.literal_eval"
+
+    # Unknown rule fallback
+    fallback_meta = get_remediation_metadata("B999")
+    assert fallback_meta["auto_fixable"] is False
+    assert fallback_meta["safe_alternative"] is None
+    assert "B999" in fallback_meta["description"]
+
+
+def test_patch_code_snippet_top_5_patterns():
+    """Verify code snippet patching for top 5 Bandit findings."""
+    # 1. B506: yaml.load -> yaml.safe_load
+    b506_in = "data = yaml.load(stream, Loader=yaml.Loader)"
+    assert patch_code_snippet(b506_in, "B506") == "data = yaml.safe_load(stream)"
+
+    b506_simple = "doc = yaml.load(f.read())"
+    assert patch_code_snippet(b506_simple, "B506") == "doc = yaml.safe_load(f.read())"
+
+    # 2. B303: hashlib.md5 / sha1 -> hashlib.sha256
+    b303_md5 = 'token_hash = hashlib.md5(secret).hexdigest()'
+    assert patch_code_snippet(b303_md5, "B303") == 'token_hash = hashlib.sha256(secret).hexdigest()'
+
+    b303_sha1 = 'digest = hashlib.sha1(payload).digest()'
+    assert patch_code_snippet(b303_sha1, "B303") == 'digest = hashlib.sha256(payload).digest()'
+
+    # 3. B201: debug=True -> debug=False
+    b201_in = 'app.run(host="0.0.0.0", port=5000, debug=True)'
+    assert patch_code_snippet(b201_in, "B201") == 'app.run(host="0.0.0.0", port=5000, debug=False)'
+
+    # 4. B306: tempfile.mktemp() -> tempfile.NamedTemporaryFile()
+    b306_in = 'tmp = tempfile.mktemp(suffix=".txt")'
+    assert patch_code_snippet(b306_in, "B306") == 'tmp = tempfile.NamedTemporaryFile(suffix=".txt")'
+
+    # 5. B113: requests call without timeout -> requests call with timeout=10
+    b113_get = 'resp = requests.get("https://api.example.com/v1")'
+    assert patch_code_snippet(b113_get, "B113") == 'resp = requests.get("https://api.example.com/v1", timeout=10)'
+
+    b113_post = 'resp = requests.post(url, data=payload, headers=hdr)'
+    assert patch_code_snippet(b113_post, "B113") == 'resp = requests.post(url, data=payload, headers=hdr, timeout=10)'
+
+    # Additional auto-fix rules
+    # B501: verify=False -> verify=True
+    assert patch_code_snippet('requests.get(url, verify=False)', "B501") == 'requests.get(url, verify=True)'
+
+    # B604: shell=True -> shell=False
+    assert patch_code_snippet('subprocess.call(cmd, shell=True)', "B604") == 'subprocess.call(cmd, shell=False)'
+
+    # B701: autoescape=False -> autoescape=True
+    assert patch_code_snippet('Environment(autoescape=False)', "B701") == 'Environment(autoescape=True)'
+
+
+def test_patch_code_snippet_no_op():
+    """Verify that patch_code_snippet returns None when no fix is needed or applicable."""
+    # Already safe requests call with timeout
+    assert patch_code_snippet('resp = requests.get(url, timeout=5)', "B113") is None
+
+    # Already safe yaml.safe_load
+    assert patch_code_snippet('data = yaml.safe_load(f)', "B506") is None
+
+    # Unsupported or non-auto-fixable rule
+    assert patch_code_snippet('eval(user_input)', "B307") is None
+    assert patch_code_snippet('', "B506") is None
+

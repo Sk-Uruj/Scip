@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 from remediation.apply import apply_upgrades, make_workspace
+from remediation.code_patcher import (
+    apply_code_patches,
+    can_auto_patch,
+    generate_file_patch,
+    patch_line,
+)
 from remediation.plan import Plan, Upgrade, jump_size, plan_upgrades
 from remediation.run import main
 from remediation.verify import run_tests, verify
@@ -286,3 +292,87 @@ def test_cli_bad_inputs_return_2(tmp_path, capsys):
     assert main([str(tmp_path / "missing"), "--scan", "x.json"]) == 2
     repo = _repo(tmp_path)
     assert main([str(repo), "--scan", str(tmp_path / "nope.json")]) == 2
+
+
+# ------------------------------------------------------------------ Code Patcher (Step 9)
+def test_code_patcher_can_auto_patch():
+    assert can_auto_patch({"title": "Bandit B506: yaml.load", "extra": {"test_id": "B506"}}) is True
+    assert can_auto_patch({"title": "Bandit B303: MD5", "extra": {"test_id": "B303"}}) is True
+    assert can_auto_patch({"title": "Bandit B201: debug=True", "extra": {"test_id": "B201"}}) is True
+    assert can_auto_patch({"title": "Bandit B306: mktemp", "extra": {"test_id": "B306"}}) is True
+    assert can_auto_patch({"title": "Bandit B113: requests timeout", "extra": {"test_id": "B113"}}) is True
+    assert can_auto_patch({"title": "Bandit B102: exec", "extra": {"test_id": "B102"}}) is False
+
+
+def test_code_patcher_patch_line():
+    patched, reason = patch_line("    data = yaml.load(f, Loader=yaml.Loader)", "B506")
+    assert patched == "    data = yaml.safe_load(f)"
+    assert reason == ""
+
+    # Line where pattern doesn't match
+    failed, reason = patch_line("    x = 1 + 2", "B506")
+    assert failed is None
+    assert "not found" in reason
+
+
+def test_code_patcher_generate_file_patch():
+    content = (
+        "import yaml\n"
+        "import hashlib\n"
+        "\n"
+        "def load_config(f):\n"
+        "    return yaml.load(f)\n"
+        "\n"
+        "def compute_hash(data):\n"
+        "    return hashlib.md5(data).hexdigest()\n"
+    )
+    findings = [
+        {"file": "app.py", "line": 5, "extra": {"test_id": "B506", "remediation": {"auto_fixable": True}}},
+        {"file": "app.py", "line": 8, "extra": {"test_id": "B303", "remediation": {"auto_fixable": True}}},
+    ]
+    new_content, diff, edits = generate_file_patch("app.py", content, findings)
+    assert "yaml.safe_load(f)" in new_content
+    assert "hashlib.sha256(data).hexdigest()" in new_content
+    assert "-    return yaml.load(f)" in diff
+    assert "+    return yaml.safe_load(f)" in diff
+    assert "-    return hashlib.md5(data).hexdigest()" in diff
+    assert "+    return hashlib.sha256(data).hexdigest()" in diff
+    assert len(edits) == 2
+    assert all(e.applied for e in edits)
+
+
+def test_code_patcher_apply_code_patches_leaves_original_untouched(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    app_py = repo / "app.py"
+    app_py.write_text(
+        "import flask\n"
+        "app = flask.Flask(__name__)\n"
+        "app.run(host='0.0.0.0', port=5000, debug=True)\n",
+        encoding="utf-8",
+    )
+    before_bytes = app_py.read_bytes()
+
+    findings = [
+        {
+            "file": "app.py",
+            "line": 3,
+            "extra": {"test_id": "B201", "remediation": {"auto_fixable": True}},
+        }
+    ]
+
+    dest_ws = tmp_path / "workspace"
+    result = apply_code_patches(repo, findings, dest_path=dest_ws)
+
+    # 1. Original repository file is never touched
+    assert app_py.read_bytes() == before_bytes
+
+    # 2. Workspace copy has the patch applied
+    patched_ws_app = result.workspace / "app.py"
+    assert patched_ws_app.exists()
+    assert "debug=False" in patched_ws_app.read_text(encoding="utf-8")
+    assert "-app.run(host='0.0.0.0', port=5000, debug=True)" in result.diff
+    assert "+app.run(host='0.0.0.0', port=5000, debug=False)" in result.diff
+    assert len(result.applied) == 1
+    assert result.applied[0].test_id == "B201"
+

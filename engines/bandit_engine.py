@@ -134,19 +134,272 @@ RULE_SEVERITY_BASE: Dict[str, float] = {k: v[0] for k, v in BANDIT_RULE_CALIBRAT
 RULE_EXPLOIT_BASE: Dict[str, float] = {k: v[1] for k, v in BANDIT_RULE_CALIBRATION.items()}
 
 COMMON_FIX_HINTS: Dict[str, str] = {
-    "B506": "Use yaml.safe_load() instead of yaml.load() to prevent arbitrary code execution.",
+    # B1xx: General & Hardcoded Credentials / Misc
+    "B101": "Use explicit error handling or validation checks instead of assert in production code.",
+    "B102": "Avoid exec(). Refactor code to use safe alternatives, dispatch tables, or ast.literal_eval().",
+    "B103": "Avoid overly permissive file permissions (e.g. 0o777). Use restricted permissions like 0o600 or 0o700.",
+    "B104": "Avoid binding to all interfaces (0.0.0.0). Bind explicitly to 127.0.0.1 or a specific internal IP.",
+    "B105": "Store passwords and secrets in environment variables or a secrets manager, not hardcoded in source code.",
+    "B106": "Pass credentials via environment variables or a secure vault instead of hardcoding in function arguments.",
+    "B107": "Do not use hardcoded secret values as default parameter values. Use None and load from environment.",
+    "B108": "Avoid hardcoded /tmp paths. Use tempfile.NamedTemporaryFile() or tempfile.mkdtemp().",
+    "B110": "Avoid empty except: pass blocks. Log the exception or handle specific error types explicitly.",
+    "B112": "Avoid try-except-continue blocks that silently ignore errors. Log the exception before continuing.",
+    "B113": "Add a timeout parameter to requests call (e.g., requests.get(url, timeout=10)).",
+
+    # B2xx: Web & Framework
+    "B201": "Do not run Flask with debug=True in production. Set debug=False and use an environment variable.",
+    "B202": "Extract tar files safely by validating member paths against directory traversal (or use filter='data' in Python 3.12+).",
+
+    # B3xx: Crypto, Serialization & Input Injection
     "B301": "Pickle is insecure for untrusted inputs. Use json, protocol buffers, or cryptographic signing.",
+    "B302": "Avoid marshal serialization for untrusted data. Use json or protobuf instead.",
     "B303": "Use a secure cryptographic hash (e.g. hashlib.sha256()) instead of MD5/SHA1.",
     "B304": "Avoid weak ciphers (e.g. DES, ARC4). Use AES-GCM or ChaCha20-Poly1305 from cryptography library.",
     "B305": "Avoid weak cipher modes. Use authenticated cipher modes like AES-GCM.",
-    "B113": "Add a timeout parameter to requests call (e.g., requests.get(url, timeout=10)).",
+    "B306": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp().",
+    "B307": "Avoid eval(). Use ast.literal_eval() for parsing literals or refactor logic without dynamic evaluation.",
+    "B308": "Avoid django.utils.safestring.mark_safe() on untrusted user input to prevent Cross-Site Scripting (XSS).",
+    "B309": "Avoid HTTPSConnection without SSL certificate verification. Use requests or http.client with a verified SSLContext.",
+    "B310": "Audit urllib.request.urlopen() URLs. Restrict allowed URL schemes to ('http', 'https') to prevent file:// and SSRF.",
+    "B311": "Do not use random for security or cryptographic purposes. Use secrets module or os.urandom().",
+    "B312": "Avoid telnetlib as Telnet transmits data in plaintext. Use paramiko or SSH/TLS-based protocols.",
+    "B313": "xml.etree.cElementTree is vulnerable to XML attacks. Use defusedxml.ElementTree for parsing untrusted XML.",
+    "B314": "xml.etree.ElementTree is vulnerable to XML attacks. Use defusedxml.ElementTree for untrusted XML.",
+    "B315": "xml.parsers.expat expatreader is vulnerable to XML entity expansion. Use defusedxml.expatreader.",
+    "B316": "xml.parsers.expat expatbuilder is vulnerable to XML attacks. Use defusedxml.expatbuilder.",
+    "B317": "xml.sax is vulnerable to entity expansion and external entities. Use defusedxml.sax.",
+    "B318": "xml.dom.minidom is vulnerable to entity expansion and XML attacks. Use defusedxml.minidom.",
+    "B319": "xml.dom.pulldom is vulnerable to entity expansion and XML attacks. Use defusedxml.pulldom.",
+    "B320": "lxml.etree is vulnerable to XML entity attacks. Use defusedxml.lxml or resolve_entities=False.",
+    "B321": "ftplib transmits credentials and data in cleartext. Use SFTP (paramiko) or FTPS with TLS.",
+    "B323": "Do not use ssl._create_unverified_context(). Use ssl.create_default_context() to enforce certificate validation.",
+    "B324": "Specify usedforsecurity=False if hashing with MD5/SHA1 strictly for non-cryptographic checksums.",
+    "B325": "tempnam and tmpnam are insecure and deprecated. Use tempfile.NamedTemporaryFile() instead.",
+
+    # B4xx: Import Audits
+    "B401": "Telnet is an insecure plaintext protocol. Replace telnetlib with SSH (paramiko) or TLS-encrypted connections.",
+    "B402": "FTP is an insecure plaintext protocol. Replace ftplib with SFTP via paramiko or FTPS.",
+    "B403": "pickle is vulnerable to arbitrary code execution during deserialization. Use json or protobuf for untrusted inputs.",
+    "B404": "Audit subprocess usage. Ensure commands are executed without shell=True and with validated arguments.",
+    "B405": "Standard xml.etree is vulnerable to XML entity attacks. Consider importing defusedxml.ElementTree.",
+    "B406": "Standard xml.sax is vulnerable to XML entity attacks. Consider importing defusedxml.sax.",
+    "B407": "Standard xml.parsers.expat is vulnerable to XML attacks. Consider importing defusedxml.expatbuilder.",
+    "B408": "Standard xml.dom.minidom is vulnerable to XML attacks. Consider importing defusedxml.minidom.",
+    "B409": "Standard xml.dom.pulldom is vulnerable to XML attacks. Consider importing defusedxml.pulldom.",
+    "B410": "lxml can be vulnerable to XML external entity attacks. Ensure XMLParser has resolve_entities=False or use defusedxml.",
+    "B411": "xmlrpclib is vulnerable to XML attacks and insecure communication. Use modern JSON-RPC over HTTPS.",
+    "B412": "wsgiref server may be vulnerable to HTTPoxy attacks. Do not trust the HTTP_PROXY header in CGI/WSGI environments.",
+    "B413": "pycrypto is unmaintained and contains known vulnerabilities. Migrate to the cryptography library.",
+    "B415": "pyghmi may expose sensitive IPMI operations over plaintext. Verify secure TLS transport and credential management.",
+
+    # B5xx: SSL / TLS / Cryptography
     "B501": "Do not set verify=False on HTTPS requests. Ensure valid certificates are trusted.",
+    "B502": "Avoid deprecated SSL/TLS protocols (SSLv2, SSLv3, TLSv1, TLSv1.1). Use ssl.PROTOCOL_TLS_CLIENT with TLSv1.2+.",
+    "B503": "Do not create SSL contexts without SNI and certificate verification. Use ssl.create_default_context().",
+    "B504": "Do not disable certificate revocation checks. Ensure CRL/OCSP checking is properly configured if used.",
+    "B505": "Weak cryptographic key size detected. Use RSA keys of at least 2048 bits or ECC with curves P-256+.",
+    "B506": "Use yaml.safe_load() instead of yaml.load() to prevent arbitrary code execution.",
+    "B507": "Do not disable SSH host key verification (AutoAddPolicy). Use RejectPolicy and manage known_hosts.",
+    "B508": "SNMP v1 and v2c send credentials in plaintext. Upgrade to SNMPv3 with authPriv privacy.",
+    "B509": "Weak SNMP encryption/authentication used. Use SHA for authentication and AES-128+ for privacy in SNMPv3.",
+
+    # B6xx: Shell & SQL Injection
+    "B601": "Avoid calling paramiko.SSHClient.exec_command() with unsanitized shell inputs. Validate parameters strictly.",
     "B602": "Avoid shell=True in subprocess calls. Pass arguments as a list and validate input.",
     "B603": "Ensure arguments passed to subprocess are strictly validated or use an allowlist.",
+    "B604": "Function call with shell=True detected. Set shell=False and pass arguments as a list.",
+    "B605": "Starting a process with a shell can lead to shell injection. Avoid os.system() and use subprocess.run(..., shell=False).",
+    "B606": "Process started without shell. Ensure executable path and argument list are properly validated.",
+    "B607": "Starting process with partial path is vulnerable to PATH manipulation. Use an absolute path or shutil.which().",
     "B608": "Use parameterized SQL queries with placeholders instead of string formatting or concatenation.",
-    "B324": "Specify usedforsecurity=False if hashing with MD5/SHA1 strictly for non-cryptographic checksums.",
-    "B306": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp().",
+    "B609": "Wildcard injection vulnerability in Linux command. Avoid using '*' with tar, chown, or chmod in shell calls.",
+    "B610": "Django extra() is prone to SQL injection. Refactor query to use standard ORM methods (filter, annotate).",
+    "B611": "Django RawSQL is prone to SQL injection. Use parameterized queries with params argument or standard ORM.",
+    "B612": "logging.config.listen() can execute arbitrary code over the network. Bind to localhost or require authentication.",
+    "B613": "Trojan Source bidirectional Unicode control characters detected. Remove hidden direction control characters.",
+    "B614": "torch.load() uses pickle by default and can execute arbitrary code. Specify weights_only=True in torch.load().",
+    "B615": "Hugging Face model download without revision pin or from untrusted repo. Pin revision commit SHA.",
+
+    # B7xx: Template Injection & XSS
+    "B701": "Jinja2 autoescape is disabled or set to False. Enable autoescape=True (or select_autoescape()) to prevent XSS.",
+    "B702": "Mako templates do not autoescape by default. Apply ${val | h} escaping or enable default_filters=['h'].",
+    "B703": "Django mark_safe() bypasses HTML escaping. Avoid calling mark_safe() on unescaped or user-controlled input.",
+    "B704": "markupsafe.Markup() bypasses escaping and can introduce XSS. Use escape() before wrapping in Markup().",
 }
+
+# Structured remediation templates for auto-patching and high-value fixes (Step 9 Integration)
+REMEDIATION_TEMPLATES: Dict[str, Dict[str, Any]] = {
+    # Top 5 Auto-Fixable Rules
+    "B506": {
+        "safe_alternative": "yaml.safe_load",
+        "import_required": "yaml",
+        "auto_fixable": True,
+        "replacement_pattern": "yaml.safe_load({arg})",
+        "description": "Replace unsafe yaml.load() with yaml.safe_load().",
+    },
+    "B303": {
+        "safe_alternative": "hashlib.sha256",
+        "import_required": "hashlib",
+        "auto_fixable": True,
+        "replacement_pattern": "hashlib.sha256({arg})",
+        "description": "Replace weak MD5/SHA1 hash with hashlib.sha256().",
+    },
+    "B201": {
+        "safe_alternative": "debug=False",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "app.run(..., debug=False)",
+        "description": "Disable debug mode in Flask app.run().",
+    },
+    "B306": {
+        "safe_alternative": "tempfile.NamedTemporaryFile",
+        "import_required": "tempfile",
+        "auto_fixable": True,
+        "replacement_pattern": "tempfile.NamedTemporaryFile()",
+        "description": "Replace insecure tempfile.mktemp() with tempfile.NamedTemporaryFile().",
+    },
+    "B113": {
+        "safe_alternative": "timeout=10",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "requests.{method}(..., timeout=10)",
+        "description": "Add explicit timeout parameter to HTTP requests call.",
+    },
+
+    # Additional high-value structured guidance
+    "B102": {
+        "safe_alternative": "ast.literal_eval",
+        "import_required": "ast",
+        "auto_fixable": False,
+        "replacement_pattern": "ast.literal_eval({arg})",
+        "description": "Refactor dynamic exec() to safe evaluation or dispatch table.",
+    },
+    "B307": {
+        "safe_alternative": "ast.literal_eval",
+        "import_required": "ast",
+        "auto_fixable": False,
+        "replacement_pattern": "ast.literal_eval({arg})",
+        "description": "Replace eval() with ast.literal_eval() for literal evaluation.",
+    },
+    "B324": {
+        "safe_alternative": "usedforsecurity=False",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "hashlib.new(..., usedforsecurity=False)",
+        "description": "Specify usedforsecurity=False for non-cryptographic hashing.",
+    },
+    "B501": {
+        "safe_alternative": "verify=True",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "requests.{method}(..., verify=True)",
+        "description": "Enable TLS certificate verification on HTTPS request.",
+    },
+    "B602": {
+        "safe_alternative": "shell=False",
+        "import_required": "shlex",
+        "auto_fixable": False,
+        "replacement_pattern": "subprocess.run(shlex.split({cmd}), shell=False)",
+        "description": "Pass arguments as a list and set shell=False.",
+    },
+    "B604": {
+        "safe_alternative": "shell=False",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "func(..., shell=False)",
+        "description": "Set shell=False in function call.",
+    },
+    "B614": {
+        "safe_alternative": "weights_only=True",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "torch.load(..., weights_only=True)",
+        "description": "Specify weights_only=True in torch.load().",
+    },
+    "B701": {
+        "safe_alternative": "autoescape=True",
+        "import_required": None,
+        "auto_fixable": True,
+        "replacement_pattern": "Environment(..., autoescape=True)",
+        "description": "Enable autoescape in Jinja2 environment.",
+    },
+}
+
+
+def get_remediation_metadata(test_id: Optional[str]) -> Dict[str, Any]:
+    """Return structured remediation guidance for a Bandit test_id."""
+    t_id = test_id.upper() if test_id else "UNKNOWN"
+    if t_id in REMEDIATION_TEMPLATES:
+        return dict(REMEDIATION_TEMPLATES[t_id])
+    hint = COMMON_FIX_HINTS.get(
+        t_id,
+        f"Review Bandit rule {t_id} and refactor the code to eliminate this pattern.",
+    )
+    return {
+        "safe_alternative": None,
+        "import_required": None,
+        "auto_fixable": False,
+        "replacement_pattern": None,
+        "description": hint,
+    }
+
+
+def patch_code_snippet(code: str, test_id: str) -> Optional[str]:
+    """Generate an automated code fix for known auto-fixable Bandit rules.
+
+    Returns the patched string if a transformation is applied, or None if no fix applies.
+    """
+    t_id = test_id.upper() if test_id else ""
+    if not code or not t_id:
+        return None
+
+    patched = code
+    if t_id == "B506":
+        # yaml.load(...) -> yaml.safe_load(...)
+        if "yaml.load" in patched:
+            patched = re.sub(r"\byaml\.load\s*\(", "yaml.safe_load(", patched)
+            patched = re.sub(r",\s*Loader\s*=\s*yaml\.[A-Za-z0-9_]+", "", patched)
+    elif t_id == "B303":
+        # hashlib.md5 / sha1 -> hashlib.sha256
+        patched = re.sub(r"\bhashlib\.(?:md5|sha1)\s*\(", "hashlib.sha256(", patched)
+        patched = re.sub(r"\b(?:Crypto\.Hash\.)?MD5\.new\s*\(", "Crypto.Hash.SHA256.new(", patched)
+    elif t_id == "B201":
+        # app.run(..., debug=True) -> app.run(..., debug=False)
+        patched = re.sub(r"\bdebug\s*=\s*True\b", "debug=False", patched)
+    elif t_id == "B306":
+        # tempfile.mktemp() -> tempfile.NamedTemporaryFile()
+        patched = re.sub(r"\btempfile\.mktemp\s*\(", "tempfile.NamedTemporaryFile(", patched)
+        patched = re.sub(r"(?<!tempfile\.)\bmktemp\s*\(", "tempfile.NamedTemporaryFile(", patched)
+    elif t_id == "B113":
+        # Add timeout=10 to requests calls missing a timeout
+        if "timeout" not in patched:
+            pattern = re.compile(
+                r"\b((?:requests|session)\.(?:get|post|put|delete|patch|head|options|request))\((.*?)\)",
+                re.DOTALL,
+            )
+            def _add_timeout(m: re.Match) -> str:
+                call_name = m.group(1)
+                args = m.group(2).strip()
+                if not args:
+                    return f"{call_name}(timeout=10)"
+                return f"{call_name}({args}, timeout=10)"
+            patched = pattern.sub(_add_timeout, patched)
+    elif t_id == "B501":
+        # verify=False -> verify=True
+        patched = re.sub(r"\bverify\s*=\s*False\b", "verify=True", patched)
+    elif t_id == "B604":
+        # shell=True -> shell=False
+        patched = re.sub(r"\bshell\s*=\s*True\b", "shell=False", patched)
+    elif t_id == "B614":
+        # torch.load(..., weights_only=True)
+        if "weights_only" not in patched and "torch.load" in patched:
+            patched = re.sub(r"\btorch\.load\((.*?)\)", r"torch.load(\1, weights_only=True)", patched)
+    elif t_id == "B701":
+        # autoescape=False -> autoescape=True
+        patched = re.sub(r"\bautoescape\s*=\s*False\b", "autoescape=True", patched)
+
+    return patched if patched != code else None
 
 SKIP_DIRS = {".git", ".hg", "venv", ".venv", "node_modules", "__pycache__", ".tox"}
 
@@ -365,11 +618,12 @@ class BanditEngine(Engine):
         # Exploitability heuristic based on rule calibration and confidence
         exploitability = _calculate_exploitability(issue_sev, issue_conf, test_id=test_id)
 
-        # Fix hint
+        # Fix hint & structured remediation metadata (Step 9 Integration)
         fix_hint = COMMON_FIX_HINTS.get(
             test_id,
             f"Review Bandit rule {test_id} ({r.get('more_info', '')}) and refactor the code to eliminate this pattern.",
         )
+        remediation_meta = get_remediation_metadata(test_id)
 
         # Evidence
         code_snippet = (r.get("code") or "").strip()
@@ -394,5 +648,6 @@ class BanditEngine(Engine):
                 "col_offset": r.get("col_offset"),
                 "end_col_offset": r.get("end_col_offset"),
                 "more_info": r.get("more_info", ""),
+                "remediation": remediation_meta,
             },
         ))
