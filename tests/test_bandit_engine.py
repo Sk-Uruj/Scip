@@ -10,6 +10,7 @@ from core.finding import Finding
 from engines.bandit_engine import (
     BanditEngine,
     _calculate_severity,
+    _calculate_exploitability,
     _rel_path,
 )
 
@@ -90,20 +91,39 @@ def test_parse_canned_bandit_output(tmp_path):
     findings = engine._parse_output(raw_stdout, tmp_path)
 
     assert len(findings) == 2
-    # Sorted by severity desc
-    assert findings[0].engine == "bandit"
-    assert findings[0].file == "crypto.py"
-    assert findings[0].line == 15
-    assert findings[0].cwe == "CWE-327"
-    assert findings[0].severity == 8.5
-    assert "B303" in findings[0].title
-    assert "hashlib.sha256" in findings[0].fix_hint
+    # B506 (arbitrary code execution) is prioritized above B303 (weak hash)
+    assert findings[0].file == "app.py"
+    assert findings[0].cwe == "CWE-502"
+    assert findings[0].severity == 9.5
+    assert findings[0].exploitability == 0.85
+    assert "yaml.safe_load" in findings[0].fix_hint
 
-    assert findings[1].file == "app.py"
-    assert findings[1].cwe == "CWE-502"
-    assert findings[1].severity == 5.5
-    assert "yaml.safe_load" in findings[1].fix_hint
+    assert findings[1].engine == "bandit"
+    assert findings[1].file == "crypto.py"
+    assert findings[1].line == 15
+    assert findings[1].cwe == "CWE-327"
+    assert findings[1].severity == 8.5
+    assert findings[1].exploitability == 0.35
+    assert "B303" in findings[1].title
+    assert "hashlib.sha256" in findings[1].fix_hint
     assert engine.stats["findings_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "sev,conf,test_id,expected_sev,expected_exploit",
+    [
+        ("MEDIUM", "HIGH", "B506", 9.5, 0.85),   # yaml_load: RCE elevated from 5.5 to 9.5
+        ("HIGH", "HIGH", "B102", 9.7, 0.88),     # exec: critical RCE
+        ("HIGH", "HIGH", "B602", 9.5, 0.85),     # subprocess shell=True
+        ("MEDIUM", "HIGH", "B608", 9.0, 0.80),   # SQL injection
+        ("LOW", "HIGH", "B113", 4.5, 0.25),      # timeout: low severity
+        ("LOW", "MEDIUM", "B108", 4.5, 0.24),    # tmp directory
+        ("MEDIUM", "LOW", "B506", 8.5, 0.42),    # low confidence damping
+    ],
+)
+def test_calibrated_severity_and_exploitability(sev, conf, test_id, expected_sev, expected_exploit):
+    assert _calculate_severity(sev, conf, test_id=test_id) == expected_sev
+    assert _calculate_exploitability(sev, conf, test_id=test_id) == expected_exploit
 
 
 def test_bandit_empty_output(tmp_path):
