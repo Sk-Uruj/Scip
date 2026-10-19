@@ -15,6 +15,7 @@ from remediation.code_patcher import (
     apply_code_patches,
     can_auto_patch,
     generate_file_patch,
+    get_node_span,
     patch_file_content,
     patch_single_snippet,
     safe_resolve_target,
@@ -804,28 +805,70 @@ def test_code_patcher_kwargs_guard_b113_and_b614():
 
 
 def test_code_patcher_postcondition_count_check_reaches_and_rejects():
-    """Verify that a patch where compliant call count check fails triggers rejection."""
+    """Verify that a patch where compliant call count fails to increase by 1 is rejected by postcondition."""
     from remediation.code_patcher import RULE_PATCHERS, RulePatcher
 
-    orig_patcher = RULE_PATCHERS.get("B113")
-    # A strict postcondition that is deliberately unsatisfied by the transformed node
-    strict_post = lambda node: False
-    test_patcher = RulePatcher(
+    orig_b113 = RULE_PATCHERS["B113"]
+
+    # Case A: Patch function lands timeout=10 in a comment; compliant call exists elsewhere
+    def patch_comment_only(src: str, call: ast.Call):
+        start, end = get_node_span(src, call)
+        call_text = src[start:end]
+        return src[:end] + "  # timeout=10" + src[end:], ""
+
+    patcher_comment = RulePatcher(
         test_id="B113",
         tier="mechanical",
-        description="test",
-        patch_fn=orig_patcher.patch_fn,
-        call_filter=orig_patcher.call_filter,
-        postcondition=strict_post,
-        review_note="test note",
+        description="test comment patcher",
+        patch_fn=patch_comment_only,
+        call_filter=orig_b113.call_filter,
+        postcondition=orig_b113.postcondition,
+        review_note="comment patcher",
     )
-    with patch.dict(RULE_PATCHERS, {"B113": test_patcher}):
-        code = "res = requests.get('https://example.com')\n"
-        out, edits = patch_file_content(code, [{"line": 1, "extra": {"test_id": "B113"}}])
-        assert edits[0].applied is False
-        assert edits[0].status == PatchStatus.PATTERN_NOT_FOUND.value
-        assert "Postcondition failed" in edits[0].reason
-        assert out == code
+    with patch.dict(RULE_PATCHERS, {"B113": patcher_comment}):
+        code_a = (
+            "import requests\n"
+            "r1 = requests.get('https://example.com/ok', timeout=5)\n"
+            "r2 = requests.get('https://example.com/bad')\n"
+        )
+        out_a, edits_a = patch_file_content(code_a, [{"line": 3, "extra": {"test_id": "B113"}}])
+        assert edits_a[0].applied is False
+        assert edits_a[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+        assert "Postcondition failed" in edits_a[0].reason
+        assert out_a == code_a
+
+    # Case B: Patched call satisfies postcondition, BUT overall compliant count does NOT increase by 1
+    # (e.g. bug where patcher made line 3 compliant while clobbering line 2's timeout)
+    def patch_clobber_existing(src: str, call: ast.Call):
+        # Generates a compliant r2, but strips timeout from r1
+        new_src = (
+            "import requests\n"
+            "r1 = requests.get('https://example.com/ok')\n"
+            "r2 = requests.get('https://example.com/bad', timeout=10)\n"
+        )
+        return new_src, ""
+
+    patcher_clobber = RulePatcher(
+        test_id="B113",
+        tier="mechanical",
+        description="test clobber patcher",
+        patch_fn=patch_clobber_existing,
+        call_filter=orig_b113.call_filter,
+        postcondition=orig_b113.postcondition,
+        review_note="clobber patcher",
+    )
+    with patch.dict(RULE_PATCHERS, {"B113": patcher_clobber}):
+        code_b = (
+            "import requests\n"
+            "r1 = requests.get('https://example.com/ok', timeout=5)\n"
+            "r2 = requests.get('https://example.com/bad')\n"
+        )
+        out_b, edits_b = patch_file_content(code_b, [{"line": 3, "extra": {"test_id": "B113"}}])
+        # Even though r2 at line 3 is compliant in the new tree, compliant count remained 1 (did not increase by 1)
+        assert edits_b[0].applied is False
+        assert edits_b[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+        assert "Postcondition failed" in edits_b[0].reason
+        assert out_b == code_b
 
 
 def test_code_patcher_python_38_keyword_position_fallback():
@@ -866,6 +909,6 @@ def test_apply_upgrades_real_symlink_rejection(tmp_path):
     ]
     res = apply_upgrades(ws, upgrades)
     assert len(res.applied) == 0
-    assert any("Symlink rejected" in e.reason for e in res.edits)
+    assert any("symlink rejected" in e.reason.lower() for e in res.edits)
     # Target outside file must remain untouched
     assert outside.read_text(encoding="utf-8") == "requests==2.20.0\n"

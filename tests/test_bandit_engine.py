@@ -429,13 +429,14 @@ def test_damping_and_calibration_in_test_and_sample_code(tmp_path):
         "test_id": "B105",
         "test_name": "hardcoded_password_string",
         "issue_severity": "LOW",
-        "issue_confidence": "LOW",
+        "issue_confidence": "MEDIUM",
         "filename": "examples/demo.py",
         "line_number": 5,
     }
     f_sample = engine._make_finding(r_sample, tmp_path)
     assert f_sample.exposure is None
-    assert f_sample.exploitability in (0.07, 0.08)  # 0.15 * 0.5 = 0.075, rounded to 2 decimals
+    assert f_sample.fp_likelihood == "MEDIUM"
+    assert f_sample.exploitability == 0.12  # B105 MEDIUM conf = 0.30 * 0.8 = 0.24, damped by 0.5 to 0.12
 
     # 4. Low exploitability damped in test code: verify it clamps at 0.05
     r_clamp = {
@@ -717,18 +718,18 @@ def test_bandit_subprocess_exit_code_1_with_empty_stdout(tmp_path):
 
     # Case A: Exit code 1 with stderr
     mock_proc_stderr = MagicMock(returncode=1, stdout="", stderr="Bandit crashed unexpectedly: MemoryError")
-    with patch("subprocess.run", return_value=mock_proc_stderr):
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run", return_value=mock_proc_stderr):
         findings = engine.scan(str(tmp_path))
         assert findings == []
-        assert engine.stats.get("parse_error") is True
+        assert engine.stats["parse_error"] is True
         assert any("Bandit crashed unexpectedly" in err for err in engine.stats.get("errors", []))
 
     # Case B: Exit code 1 with empty stderr and empty stdout
     mock_proc_empty = MagicMock(returncode=1, stdout="", stderr="")
-    with patch("subprocess.run", return_value=mock_proc_empty):
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run", return_value=mock_proc_empty):
         findings = engine.scan(str(tmp_path))
         assert findings == []
-        assert engine.stats.get("parse_error") is True
+        assert engine.stats["parse_error"] is True
         assert any("exit code 1, failed to parse JSON output" in err for err in engine.stats.get("errors", []))
 
 
@@ -746,12 +747,12 @@ def test_bandit_engine_stats_reset_between_scans(tmp_path):
     valid_dir.mkdir()
     (valid_dir / "clean.py").write_text("print('clean')\n", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "metrics": {}}', stderr="")
         findings = engine.scan(str(valid_dir))
         assert findings == []
         assert engine.stats["errors"] == []
-        assert engine.stats.get("parse_error") is False or "parse_error" not in engine.stats
+        assert engine.stats["parse_error"] is False
         assert engine.stats["files_with_errors"] == 0
         assert engine.stats["target"] == str(valid_dir.resolve())
 
@@ -782,7 +783,7 @@ def test_bandit_dynamic_timeout_loc_scaling_tiers(tmp_path):
     engine = BanditEngine()
 
     # Tier 1: 0 LOC -> base 60s
-    with patch.object(engine, "_estimate_python_workload", return_value=(5, 0)):
+    with patch.object(engine, "is_available", return_value=True), patch.object(engine, "_estimate_python_workload", return_value=(5, 0)):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
             (tmp_path / "x.py").write_text("x = 1\n", encoding="utf-8")
@@ -790,14 +791,14 @@ def test_bandit_dynamic_timeout_loc_scaling_tiers(tmp_path):
             assert mock_run.call_args[1]["timeout"] == 60
 
     # Tier 2: 20,000 LOC -> 60 + 2*30 = 120s
-    with patch.object(engine, "_estimate_python_workload", return_value=(50, 20000)):
+    with patch.object(engine, "is_available", return_value=True), patch.object(engine, "_estimate_python_workload", return_value=(50, 20000)):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
             engine.scan(str(tmp_path))
             assert mock_run.call_args[1]["timeout"] == 120
 
     # Tier 3: 150,000 LOC -> capped at 300s
-    with patch.object(engine, "_estimate_python_workload", return_value=(500, 150000)):
+    with patch.object(engine, "is_available", return_value=True), patch.object(engine, "_estimate_python_workload", return_value=(500, 150000)):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
             engine.scan(str(tmp_path))
@@ -829,12 +830,29 @@ def test_bandit_subprocess_exit_code_1_with_findings(tmp_path):
 
     # Exit code 1 indicates Bandit found issues; stdout contains the JSON
     mock_proc = MagicMock(returncode=1, stdout=json.dumps(json_payload), stderr="")
-    with patch("subprocess.run", return_value=mock_proc):
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run", return_value=mock_proc):
         findings = engine.scan(str(tmp_path))
         assert len(findings) == 1
         assert findings[0].extra.get("test_id") == "B303"
         assert "B303" in findings[0].title
         assert engine.stats["findings_count"] == 1
+
+
+def test_bandit_exclude_paths_nested_real_bandit(tmp_path):
+    """Verify BanditEngine excludes nested directory (e.g. src/tests/) using real Bandit."""
+    engine = BanditEngine(exclude_paths=["src/tests"])
+    if not engine.is_available():
+        pytest.skip("Bandit not installed")
+
+    tests_dir = tmp_path / "src" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_something.py").write_text("import hashlib\nh = hashlib.md5(b'test')\n", encoding="utf-8")
+    (tmp_path / "src" / "main.py").write_text("import hashlib\nh = hashlib.md5(b'test')\n", encoding="utf-8")
+
+    findings = engine.scan(str(tmp_path))
+    files = {f.file.replace("\\", "/") for f in findings}
+    assert any("src/main.py" in f for f in files)
+    assert not any("test_something.py" in f for f in files)
 
 
 def test_bandit_non_ascii_findings_and_evidence(tmp_path):

@@ -128,7 +128,7 @@ def get_node_span(src: str, node: ast.AST) -> Tuple[int, int]:
         # Python 3.8 ast.keyword fallback to its value node
         return get_node_span(src, node.value)
     if lineno is None:
-        return 0, 0
+        raise ValueError(f"AST node {type(node).__name__} lacks line number position")
 
     lines = split_python_lines(src)
     line_starts = [0]
@@ -780,7 +780,10 @@ def patch_file_content(
 
         # Try candidate calls; pick the first one that successfully transforms
         for call in candidate_calls:
-            res_src, reason = patcher.patch_fn(current_content, call)
+            try:
+                res_src, reason = patcher.patch_fn(current_content, call)
+            except Exception as e:
+                res_src, reason = None, f"Patch failed: {e}"
             if res_src is not None and res_src != current_content:
                 matching_call = call
                 patched_src = res_src

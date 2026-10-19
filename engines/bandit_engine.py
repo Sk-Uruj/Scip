@@ -662,6 +662,7 @@ class BanditEngine(Engine):
             "skipped": False,
             "errors": [],
             "files_with_errors": 0,
+            "parse_error": False,
         }
 
     def is_available(self) -> bool:
@@ -734,6 +735,7 @@ class BanditEngine(Engine):
             "skipped": False,
             "errors": [],
             "files_with_errors": 0,
+            "parse_error": False,
         }
 
         if not root.exists():
@@ -806,13 +808,15 @@ class BanditEngine(Engine):
                 clean_p = str(p).strip()
                 if not clean_p or clean_p.startswith("-"):
                     continue
-                norm_p = clean_p.replace("\\", "/")
-                sanitized_excludes.append(norm_p)
-                # If bare directory, also append ./ prefix so Bandit discovery on target '.' excludes it
-                if not norm_p.startswith(("./", "*", "/")) and ":" not in norm_p:
-                    sanitized_excludes.append(f"./{norm_p}")
+                p_fwd = clean_p.replace("\\", "/")
+                p_bwd = clean_p.replace("/", "\\")
+                for variant in {p_fwd, p_bwd}:
+                    sanitized_excludes.append(variant)
+                    if not variant.startswith(("./", ".\\", "*", "/", "\\")) and ":" not in variant:
+                        sanitized_excludes.append(f"./{variant.replace('\\', '/')}")
+                        sanitized_excludes.append(f".\\{variant.replace('/', '\\')}")
             if sanitized_excludes:
-                cmd.extend(["-x", ",".join(sanitized_excludes)])
+                cmd.extend(["-x", ",".join(sorted(set(sanitized_excludes)))])
 
         # Pass target path with '--' to prevent flag injection.
         # Run with cwd=root and relative target '.' to prevent parent directories (e.g. /env/)
@@ -850,6 +854,7 @@ class BanditEngine(Engine):
 
     def _parse_output(self, data_or_stdout: Any, root: Path) -> List[Finding]:
         self.stats.setdefault("files_with_errors", 0)
+        self.stats.setdefault("parse_error", False)
         if isinstance(data_or_stdout, str):
             data = self._load_json(data_or_stdout)
             if data is None:
