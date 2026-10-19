@@ -123,20 +123,28 @@ def byte_col_to_char_col(line: str, byte_offset: int) -> int:
 
 def get_node_span(src: str, node: ast.AST) -> Tuple[int, int]:
     """Convert AST node line and column byte offsets to absolute character index span."""
+    lineno = getattr(node, "lineno", None)
+    if lineno is None and hasattr(node, "value") and isinstance(node.value, ast.AST):
+        # Python 3.8 ast.keyword fallback to its value node
+        return get_node_span(src, node.value)
+    if lineno is None:
+        return 0, 0
+
     lines = split_python_lines(src)
     line_starts = [0]
     for l in lines:
         line_starts.append(line_starts[-1] + len(l))
 
-    start_line_idx = node.lineno - 1
+    start_line_idx = lineno - 1
     start_line_text = lines[start_line_idx] if 0 <= start_line_idx < len(lines) else ""
-    start_char_col = byte_col_to_char_col(start_line_text, node.col_offset)
+    col_offset = getattr(node, "col_offset", 0)
+    start_char_col = byte_col_to_char_col(start_line_text, col_offset)
     start = line_starts[start_line_idx] + start_char_col
 
-    end_lineno = getattr(node, "end_lineno", node.lineno)
+    end_lineno = getattr(node, "end_lineno", lineno)
     end_line_idx = end_lineno - 1
     end_line_text = lines[end_line_idx] if 0 <= end_line_idx < len(lines) else ""
-    end_byte_col = getattr(node, "end_col_offset", node.col_offset)
+    end_byte_col = getattr(node, "end_col_offset", col_offset)
     end_char_col = byte_col_to_char_col(end_line_text, end_byte_col)
     end = line_starts[end_line_idx] + end_char_col
 
@@ -221,9 +229,14 @@ def _insert_call_kwarg(src: str, call_node: ast.Call, kwarg_str: str) -> str:
     # Python 3.8 compatibility: ast.keyword may not have lineno or col_offset
     call_line = getattr(call_node, "lineno", 0)
     call_col = getattr(call_node, "col_offset", 0)
+
+    def _arg_pos(n: ast.AST) -> Tuple[int, int]:
+        target = getattr(n, "value", n) if not hasattr(n, "lineno") else n
+        return (getattr(target, "lineno", call_line), getattr(target, "col_offset", call_col))
+
     all_args = sorted(
         list(call_node.args) + list(call_node.keywords),
-        key=lambda n: (getattr(n, "lineno", call_line), getattr(n, "col_offset", call_col)),
+        key=_arg_pos,
     )
     if not all_args:
         call_text = src[start:end]
@@ -291,6 +304,8 @@ def _patch_b113_requests_timeout(src: str, call_node: ast.Call) -> Tuple[Optiona
     """B113: requests.get(...) -> requests.get(..., timeout=10)."""
     if any(kw.arg == "timeout" for kw in call_node.keywords):
         return None, "requests call already specifies a timeout parameter"
+    if any(kw.arg is None for kw in call_node.keywords):
+        return None, "requests call uses **kwargs which may provide a timeout dynamically"
 
     new_src = _insert_call_kwarg(src, call_node, "timeout=10")
     return new_src, ""
@@ -345,6 +360,8 @@ def _patch_b614_torch_load(src: str, call_node: ast.Call) -> Tuple[Optional[str]
     """B614: torch.load(...) -> torch.load(..., weights_only=True)."""
     if any(kw.arg == "weights_only" for kw in call_node.keywords):
         return None, "torch.load() already specifies weights_only"
+    if any(kw.arg is None for kw in call_node.keywords):
+        return None, "torch.load() uses **kwargs which may provide weights_only dynamically"
 
     new_src = _insert_call_kwarg(src, call_node, "weights_only=True")
     return new_src, ""
@@ -955,4 +972,3 @@ def patch_single_snippet(code: str, test_id: str, line_no: int = 1) -> Tuple[Opt
         return patched, ""
     reason = edits[0].reason if edits else "No edits applied"
     return None, reason
-

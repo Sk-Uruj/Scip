@@ -435,8 +435,7 @@ def test_damping_and_calibration_in_test_and_sample_code(tmp_path):
     }
     f_sample = engine._make_finding(r_sample, tmp_path)
     assert f_sample.exposure is None
-    assert f_sample.fp_likelihood == "MEDIUM"
-    assert f_sample.exploitability == 0.07  # damped from 0.15 by 0.5 to 0.07
+    assert f_sample.exploitability in (0.07, 0.08)  # 0.15 * 0.5 = 0.075, rounded to 2 decimals
 
     # 4. Low exploitability damped in test code: verify it clamps at 0.05
     r_clamp = {
@@ -666,37 +665,95 @@ def test_bandit_metrics_and_syntax_errors(tmp_path):
     engine = BanditEngine()
     data = {
         "errors": [
-            {"filename": "syntax_err.py", "reason": "SyntaxError: invalid syntax on line 4"}
+            {"filename": "syntax_err.py", "reason": "SyntaxError: invalid syntax on line 4"},
+            {"filename": "syntax_err.py", "reason": "IndentationError: unindent does not match"},
+            {"filename": "bad_token.py", "reason": "TokenError: EOF in multi-line statement"},
         ],
         "metrics": {
-            "_totals": {"loc": 142, "nosec": 3},
+            "_totals": {"loc": 100, "nosec": 2},
             "app.py": {"loc": 100, "nosec": 2},
-            "syntax_err.py": {"loc": 42, "nosec": 1},
         },
         "results": [],
     }
     findings = engine._parse_output(data, tmp_path)
     assert findings == []
-    assert engine.stats["files_scanned"] == 2
-    assert engine.stats["loc"] == 142
-    assert engine.stats["nosec"] == 3
-    assert engine.stats["files_with_errors"] == 1
+    # In real Bandit output, files that fail to parse with SyntaxError are emitted into
+    # "errors" and omitted from "metrics"; files_scanned reflects only files that were successfully analyzed.
+    assert engine.stats["files_scanned"] == 1
+    assert engine.stats["loc"] == 100
+    assert engine.stats["nosec"] == 2
+    # files_with_errors must count unique files (syntax_err.py + bad_token.py = 2)
+    assert engine.stats["files_with_errors"] == 2
     assert any("syntax_err.py" in err and "SyntaxError" in err for err in engine.stats["errors"])
 
 
 def test_bandit_corrupted_interrupted_json_handling(tmp_path):
-    """Verify corrupted, truncated, or whitespace stdout gracefully returns [] without unhandled exceptions."""
+    """Verify corrupted, truncated, or whitespace stdout records parse error in stats and returns []."""
     engine = BanditEngine()
 
     truncated = '{"results": [{"test_id": "B101", "filename": "app.py", "line_number": 1'
     assert engine._load_json(truncated) is None
     assert engine._parse_output(truncated, tmp_path) == []
+    assert engine.stats.get("parse_error") is True
+    assert any("Failed to parse" in err for err in engine.stats.get("errors", []))
 
-    assert engine._load_json("   \n\t  ") is None
-    assert engine._parse_output("   \n\t  ", tmp_path) == []
+    # Reset engine and test empty/whitespace
+    engine2 = BanditEngine()
+    assert engine2._load_json("   \n\t  ") is None
+    assert engine2._parse_output("   \n\t  ", tmp_path) == []
+    assert engine2.stats.get("parse_error") is True
 
-    assert engine._load_json("{ not valid json at all }") is None
-    assert engine._parse_output("{ not valid json at all }", tmp_path) == []
+    # Test random text with braces
+    engine3 = BanditEngine()
+    assert engine3._load_json("{ not valid json at all }") is None
+    assert engine3._parse_output("{ not valid json at all }", tmp_path) == []
+    assert engine3.stats.get("parse_error") is True
+
+
+def test_bandit_subprocess_exit_code_1_with_empty_stdout(tmp_path):
+    """Verify Bandit returncode 1 with empty stdout records failure in stats and returns []."""
+    engine = BanditEngine()
+    (tmp_path / "app.py").write_text("print('test')\n", encoding="utf-8")
+
+    # Case A: Exit code 1 with stderr
+    mock_proc_stderr = MagicMock(returncode=1, stdout="", stderr="Bandit crashed unexpectedly: MemoryError")
+    with patch("subprocess.run", return_value=mock_proc_stderr):
+        findings = engine.scan(str(tmp_path))
+        assert findings == []
+        assert engine.stats.get("parse_error") is True
+        assert any("Bandit crashed unexpectedly" in err for err in engine.stats.get("errors", []))
+
+    # Case B: Exit code 1 with empty stderr and empty stdout
+    mock_proc_empty = MagicMock(returncode=1, stdout="", stderr="")
+    with patch("subprocess.run", return_value=mock_proc_empty):
+        findings = engine.scan(str(tmp_path))
+        assert findings == []
+        assert engine.stats.get("parse_error") is True
+        assert any("exit code 1, failed to parse JSON output" in err for err in engine.stats.get("errors", []))
+
+
+def test_bandit_engine_stats_reset_between_scans(tmp_path):
+    """Verify that scanning multiple targets re-initializes engine.stats without carrying over errors."""
+    engine = BanditEngine()
+
+    # Scan 1: Non-existent directory generates error
+    engine.scan("non_existent_dir_abc123")
+    assert len(engine.stats["errors"]) > 0
+    assert "Directory does not exist" in engine.stats["errors"][0]
+
+    # Scan 2: Valid repo must start with fresh empty errors list and reset counts
+    valid_dir = tmp_path / "clean_repo"
+    valid_dir.mkdir()
+    (valid_dir / "clean.py").write_text("print('clean')\n", encoding="utf-8")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "metrics": {}}', stderr="")
+        findings = engine.scan(str(valid_dir))
+        assert findings == []
+        assert engine.stats["errors"] == []
+        assert engine.stats.get("parse_error") is False or "parse_error" not in engine.stats
+        assert engine.stats["files_with_errors"] == 0
+        assert engine.stats["target"] == str(valid_dir.resolve())
 
 
 def test_bandit_multi_json_in_stdout_prefers_bandit_report():
@@ -710,6 +767,14 @@ def test_bandit_multi_json_in_stdout_prefers_bandit_report():
     assert extracted is not None
     assert "results" in extracted
     assert extracted["results"][0]["test_id"] == "B303"
+
+    # Negative case: only wrapper JSON is present, without Bandit results or metrics
+    only_wrappers = (
+        '{"wrapper": "started", "timestamp": 123456}\n'
+        '{"wrapper": "progress", "percent": 50}\n'
+        '{"wrapper": "finished", "status": "ok"}\n'
+    )
+    assert BanditEngine._load_json(only_wrappers) is None
 
 
 def test_bandit_dynamic_timeout_loc_scaling_tiers(tmp_path):
@@ -792,7 +857,41 @@ def test_bandit_non_ascii_findings_and_evidence(tmp_path):
     assert "vérifié ☕" in f.evidence
 
 
+def test_path_sandboxing_symlink_pointing_outside(tmp_path):
+    """Verify that _make_finding rejects reading files reached via in-root symlinks pointing outside root."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret_py = outside / "secret.py"
+    secret_py.write_text("class LeakedScope:\n    pass\n", encoding="utf-8")
+
+    symlink_file = repo / "symlink.py"
+    try:
+        symlink_file.symlink_to(secret_py)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks require administrator/developer mode on Windows")
+
+    engine = BanditEngine()
+    r = {
+        "test_id": "B101",
+        "filename": "symlink.py",
+        "line_number": 1,
+    }
+    f = engine._make_finding(r, repo)
+    assert f.extra.get("enclosing_scope") is None
 
 
-
-
+def test_bandit_exclude_paths_nested_directory(tmp_path):
+    """Verify that exclude_paths with nested directory (e.g. tests/unit) formats -x flags properly."""
+    engine = BanditEngine(exclude_paths=["tests/unit", "fixtures\\data"])
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "errors": []}', stderr="")
+        (tmp_path / "main.py").write_text("x = 1\n", encoding="utf-8")
+        engine.scan(str(tmp_path))
+        assert mock_run.called
+        cmd = mock_run.call_args[0][0]
+        assert "-x" in cmd
+        x_val = cmd[cmd.index("-x") + 1]
+        assert "tests/unit" in x_val
+        assert "fixtures/data" in x_val

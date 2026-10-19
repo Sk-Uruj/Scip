@@ -661,6 +661,7 @@ class BanditEngine(Engine):
             "findings_count": 0,
             "skipped": False,
             "errors": [],
+            "files_with_errors": 0,
         }
 
     def is_available(self) -> bool:
@@ -732,6 +733,7 @@ class BanditEngine(Engine):
             "findings_count": 0,
             "skipped": False,
             "errors": [],
+            "files_with_errors": 0,
         }
 
         if not root.exists():
@@ -804,10 +806,11 @@ class BanditEngine(Engine):
                 clean_p = str(p).strip()
                 if not clean_p or clean_p.startswith("-"):
                     continue
-                sanitized_excludes.append(clean_p)
+                norm_p = clean_p.replace("\\", "/")
+                sanitized_excludes.append(norm_p)
                 # If bare directory, also append ./ prefix so Bandit discovery on target '.' excludes it
-                if not clean_p.startswith(("./", ".\\", "*", "/", "\\")) and ":" not in clean_p:
-                    sanitized_excludes.append(f"./{clean_p}")
+                if not norm_p.startswith(("./", "*", "/")) and ":" not in norm_p:
+                    sanitized_excludes.append(f"./{norm_p}")
             if sanitized_excludes:
                 cmd.extend(["-x", ",".join(sanitized_excludes)])
 
@@ -837,21 +840,27 @@ class BanditEngine(Engine):
 
         data = self._load_json(proc.stdout)
         if data is None:
-            err_msg = proc.stderr.strip()[:300] or f"exit code {proc.returncode}, no JSON"
+            err_msg = proc.stderr.strip()[:300] or f"exit code {proc.returncode}, failed to parse JSON output"
             log.warning("Bandit execution failed: %s", err_msg)
             self.stats["errors"].append(err_msg)
+            self.stats["parse_error"] = True
             return []
 
         return self._parse_output(data, root)
 
     def _parse_output(self, data_or_stdout: Any, root: Path) -> List[Finding]:
+        self.stats.setdefault("files_with_errors", 0)
         if isinstance(data_or_stdout, str):
             data = self._load_json(data_or_stdout)
             if data is None:
+                self.stats.setdefault("errors", []).append("Failed to parse JSON output from Bandit")
+                self.stats["parse_error"] = True
                 return []
         elif isinstance(data_or_stdout, dict):
             data = data_or_stdout
         else:
+            self.stats.setdefault("errors", []).append(f"Invalid Bandit output format (expected JSON dict or string, got {type(data_or_stdout).__name__})")
+            self.stats["parse_error"] = True
             return []
 
         metrics = data.get("metrics", {})
@@ -864,12 +873,17 @@ class BanditEngine(Engine):
 
         # Capture Bandit file/syntax errors into engine stats
         errs = data.get("errors", [])
+        unique_err_files = {e.get("filename") for e in errs if isinstance(e, dict) and e.get("filename")}
+        self.stats["files_with_errors"] = len(unique_err_files)
         if errs:
             self.stats.setdefault("errors", [])
-            self.stats["files_with_errors"] = len(errs)
             for err in errs:
-                filename = err.get("filename", "unknown")
-                reason = err.get("reason", "error")
+                if isinstance(err, dict):
+                    filename = err.get("filename", "unknown")
+                    reason = err.get("reason", "error")
+                else:
+                    filename = "unknown"
+                    reason = str(err)
                 self.stats["errors"].append(f"{filename}: {reason}"[:200])
 
         results = data.get("results", [])

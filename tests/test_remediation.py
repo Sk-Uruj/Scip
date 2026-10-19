@@ -1,7 +1,9 @@
 """Tests for remediation: plan, apply (on a copy), verify, CLI."""
+import ast
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -774,11 +776,96 @@ def test_code_patcher_nested_arguments_complex():
     )
     patched, edits = patch_file_content(code, [{"line": 3, "extra": {"test_id": "B113"}}])
     assert edits[0].applied is True
-    assert "timeout=10" in patched
-    assert 'build_url("/api", params={"v": 1})' in patched
-    assert 'headers={"Auth": get_token()}' in patched
+    expected = (
+        'import requests\n'
+        'def fetch():\n'
+        '    return requests.get(build_url("/api", params={"v": 1}), headers={"Auth": get_token()}, timeout=10)\n'
+    )
+    assert patched == expected
 
 
+def test_code_patcher_kwargs_guard_b113_and_b614():
+    """Verify that calls with **kwargs are NOT auto-patched by B113 or B614 to prevent dynamic collision."""
+    # B113 with **options
+    code_b113 = "res = requests.get(url, **options)\n"
+    out_b113, edits_b113 = patch_file_content(code_b113, [{"line": 1, "extra": {"test_id": "B113"}}])
+    assert edits_b113[0].applied is False
+    assert edits_b113[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+    assert "**kwargs" in edits_b113[0].reason
+    assert out_b113 == code_b113
+
+    # B614 with **kwargs
+    code_b614 = "model = torch.load(f, **kwargs)\n"
+    out_b614, edits_b614 = patch_file_content(code_b614, [{"line": 1, "extra": {"test_id": "B614"}}])
+    assert edits_b614[0].applied is False
+    assert edits_b614[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+    assert "**kwargs" in edits_b614[0].reason
+    assert out_b614 == code_b614
 
 
+def test_code_patcher_postcondition_count_check_reaches_and_rejects():
+    """Verify that a patch where compliant call count check fails triggers rejection."""
+    from remediation.code_patcher import RULE_PATCHERS, RulePatcher
 
+    orig_patcher = RULE_PATCHERS.get("B113")
+    # A strict postcondition that is deliberately unsatisfied by the transformed node
+    strict_post = lambda node: False
+    test_patcher = RulePatcher(
+        test_id="B113",
+        tier="mechanical",
+        description="test",
+        patch_fn=orig_patcher.patch_fn,
+        call_filter=orig_patcher.call_filter,
+        postcondition=strict_post,
+        review_note="test note",
+    )
+    with patch.dict(RULE_PATCHERS, {"B113": test_patcher}):
+        code = "res = requests.get('https://example.com')\n"
+        out, edits = patch_file_content(code, [{"line": 1, "extra": {"test_id": "B113"}}])
+        assert edits[0].applied is False
+        assert edits[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+        assert "Postcondition failed" in edits[0].reason
+        assert out == code
+
+
+def test_code_patcher_python_38_keyword_position_fallback():
+    """Verify _insert_call_kwarg works when ast.keyword lacks lineno/col_offset (Python 3.8 AST shape)."""
+    from remediation.code_patcher import _insert_call_kwarg
+
+    code = "requests.get(url, headers=h)"
+    tree = ast.parse(code)
+    call_node = tree.body[0].value
+    # Simulate Python 3.8 by deleting lineno/col_offset from keywords if present
+    for kw in call_node.keywords:
+        for attr in ("lineno", "col_offset", "end_lineno", "end_col_offset"):
+            if hasattr(kw, attr):
+                delattr(kw, attr)
+
+    patched = _insert_call_kwarg(code, call_node, "timeout=10")
+    assert patched == "requests.get(url, headers=h, timeout=10)"
+
+
+def test_apply_upgrades_real_symlink_rejection(tmp_path):
+    """Verify apply_upgrades detects and rejects real symlinks targeting external files."""
+    from remediation.apply import apply_upgrades
+    from remediation.plan import Upgrade
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    outside = tmp_path / "outside_req.txt"
+    outside.write_text("requests==2.20.0\n", encoding="utf-8")
+
+    symlink_req = ws / "requirements.txt"
+    try:
+        symlink_req.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks require administrator/developer mode on Windows")
+
+    upgrades = [
+        Upgrade(file="requirements.txt", line=1, package="requests", current="2.20.0", target="2.31.0", fixes=["CVE-1"])
+    ]
+    res = apply_upgrades(ws, upgrades)
+    assert len(res.applied) == 0
+    assert any("Symlink rejected" in e.reason for e in res.edits)
+    # Target outside file must remain untouched
+    assert outside.read_text(encoding="utf-8") == "requests==2.20.0\n"
