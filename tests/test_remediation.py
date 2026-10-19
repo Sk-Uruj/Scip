@@ -756,5 +756,29 @@ def test_code_edit_record_applied_and_review_note():
     assert d["review_note"] == "Disables debug mode."
 
 
+def test_code_patcher_non_ascii_earlier_in_line():
+    """Verify that get_node_span and patching succeed even when non-ASCII chars precede the call."""
+    code = 'greeting = "Bonjour, café et thé ☕"\nres = requests.get("https://example.com", verify=False)\n'
+    patched, edits = patch_file_content(code, [{"line": 2, "extra": {"test_id": "B501"}}])
+    assert edits[0].applied is True
+    assert "verify=True" in patched
+    assert 'greeting = "Bonjour, café et thé ☕"' in patched
+
+
+def test_code_patcher_nested_arguments_complex():
+    """Verify that B113 timeout patching handles complex nested calls in arguments."""
+    code = (
+        'import requests\n'
+        'def fetch():\n'
+        '    return requests.get(build_url("/api", params={"v": 1}), headers={"Auth": get_token()})\n'
+    )
+    patched, edits = patch_file_content(code, [{"line": 3, "extra": {"test_id": "B113"}}])
+    assert edits[0].applied is True
+    assert "timeout=10" in patched
+    assert 'build_url("/api", params={"v": 1})' in patched
+    assert 'headers={"Auth": get_token()}' in patched
+
+
+
 
 

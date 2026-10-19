@@ -656,7 +656,12 @@ class BanditEngine(Engine):
         self.timeout = timeout
         self.include_suppressed = include_suppressed
         self.exclude_paths = exclude_paths
-        self.stats: Dict[str, Any] = {}
+        self.stats: Dict[str, Any] = {
+            "engine": self.name,
+            "findings_count": 0,
+            "skipped": False,
+            "errors": [],
+        }
 
     def is_available(self) -> bool:
         """Check if Bandit is installed in current Python environment or on PATH."""
@@ -858,10 +863,14 @@ class BanditEngine(Engine):
         )
 
         # Capture Bandit file/syntax errors into engine stats
-        for err in data.get("errors", []):
-            filename = err.get("filename", "unknown")
-            reason = err.get("reason", "error")
-            self.stats["errors"].append(f"{filename}: {reason}"[:200])
+        errs = data.get("errors", [])
+        if errs:
+            self.stats.setdefault("errors", [])
+            self.stats["files_with_errors"] = len(errs)
+            for err in errs:
+                filename = err.get("filename", "unknown")
+                reason = err.get("reason", "error")
+                self.stats["errors"].append(f"{filename}: {reason}"[:200])
 
         results = data.get("results", [])
         findings: List[Finding] = []

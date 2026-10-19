@@ -643,5 +643,156 @@ def test_bandit_preflight_cli_sanitization(tmp_path):
         assert any("Config file not found" in err for err in engine.stats["errors"])
 
 
+def test_bandit_all_79_rules_calibrated_and_mapped():
+    """Verify that all rules in BANDIT_TO_CWE have valid calibration entries and fix hints."""
+    from core.taxonomy import BANDIT_TO_CWE, normalize_cwe
+
+    assert len(BANDIT_TO_CWE) == 79
+    for rule_id, cwe in BANDIT_TO_CWE.items():
+        assert rule_id in BANDIT_RULE_CALIBRATION, f"Missing calibration for {rule_id}"
+        sev, exploit = BANDIT_RULE_CALIBRATION[rule_id]
+        assert 1.0 <= sev <= 10.0, f"Severity out of range for {rule_id}: {sev}"
+        assert 0.05 <= exploit <= 1.0, f"Exploitability out of range for {rule_id}: {exploit}"
+
+        assert rule_id in COMMON_FIX_HINTS, f"Missing fix hint for {rule_id}"
+        assert len(COMMON_FIX_HINTS[rule_id].strip()) > 15
+
+        norm = normalize_cwe(cwe)
+        assert norm.startswith("CWE-"), f"Invalid CWE normalization for {cwe}"
+
+
+def test_bandit_metrics_and_syntax_errors(tmp_path):
+    """Verify engine stats capture LOC, nosec counts, and Bandit syntax errors in target files."""
+    engine = BanditEngine()
+    data = {
+        "errors": [
+            {"filename": "syntax_err.py", "reason": "SyntaxError: invalid syntax on line 4"}
+        ],
+        "metrics": {
+            "_totals": {"loc": 142, "nosec": 3},
+            "app.py": {"loc": 100, "nosec": 2},
+            "syntax_err.py": {"loc": 42, "nosec": 1},
+        },
+        "results": [],
+    }
+    findings = engine._parse_output(data, tmp_path)
+    assert findings == []
+    assert engine.stats["files_scanned"] == 2
+    assert engine.stats["loc"] == 142
+    assert engine.stats["nosec"] == 3
+    assert engine.stats["files_with_errors"] == 1
+    assert any("syntax_err.py" in err and "SyntaxError" in err for err in engine.stats["errors"])
+
+
+def test_bandit_corrupted_interrupted_json_handling(tmp_path):
+    """Verify corrupted, truncated, or whitespace stdout gracefully returns [] without unhandled exceptions."""
+    engine = BanditEngine()
+
+    truncated = '{"results": [{"test_id": "B101", "filename": "app.py", "line_number": 1'
+    assert engine._load_json(truncated) is None
+    assert engine._parse_output(truncated, tmp_path) == []
+
+    assert engine._load_json("   \n\t  ") is None
+    assert engine._parse_output("   \n\t  ", tmp_path) == []
+
+    assert engine._load_json("{ not valid json at all }") is None
+    assert engine._parse_output("{ not valid json at all }", tmp_path) == []
+
+
+def test_bandit_multi_json_in_stdout_prefers_bandit_report():
+    """Verify _load_json isolates the Bandit payload when wrappers print non-Bandit JSON."""
+    raw = (
+        '{"wrapper": "started", "timestamp": 123456}\n'
+        '{"errors": [], "results": [{"test_id": "B303", "filename": "crypto.py"}], "metrics": {}}\n'
+        '{"wrapper": "finished", "status": "ok"}\n'
+    )
+    extracted = BanditEngine._load_json(raw)
+    assert extracted is not None
+    assert "results" in extracted
+    assert extracted["results"][0]["test_id"] == "B303"
+
+
+def test_bandit_dynamic_timeout_loc_scaling_tiers(tmp_path):
+    """Verify timeout scaling tiers for various LOC sizes."""
+    engine = BanditEngine()
+
+    # Tier 1: 0 LOC -> base 60s
+    with patch.object(engine, "_estimate_python_workload", return_value=(5, 0)):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
+            (tmp_path / "x.py").write_text("x = 1\n", encoding="utf-8")
+            engine.scan(str(tmp_path))
+            assert mock_run.call_args[1]["timeout"] == 60
+
+    # Tier 2: 20,000 LOC -> 60 + 2*30 = 120s
+    with patch.object(engine, "_estimate_python_workload", return_value=(50, 20000)):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
+            engine.scan(str(tmp_path))
+            assert mock_run.call_args[1]["timeout"] == 120
+
+    # Tier 3: 150,000 LOC -> capped at 300s
+    with patch.object(engine, "_estimate_python_workload", return_value=(500, 150000)):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}')
+            engine.scan(str(tmp_path))
+            assert mock_run.call_args[1]["timeout"] == 300
+
+
+def test_bandit_subprocess_exit_code_1_with_findings(tmp_path):
+    """Verify Bandit returncode 1 with valid JSON results is successfully parsed as findings."""
+    engine = BanditEngine()
+    py = tmp_path / "main.py"
+    py.write_text("import hashlib\nh = hashlib.md5(b'test')\n", encoding="utf-8")
+
+    json_payload = {
+        "errors": [],
+        "metrics": {"_totals": {"loc": 2, "nosec": 0}},
+        "results": [
+            {
+                "test_id": "B303",
+                "test_name": "hash_func",
+                "filename": "main.py",
+                "line_number": 2,
+                "issue_severity": "HIGH",
+                "issue_confidence": "HIGH",
+                "issue_text": "Use of weak MD5 hash function.",
+                "code": "2 h = hashlib.md5(b'test')\n",
+            }
+        ],
+    }
+
+    # Exit code 1 indicates Bandit found issues; stdout contains the JSON
+    mock_proc = MagicMock(returncode=1, stdout=json.dumps(json_payload), stderr="")
+    with patch("subprocess.run", return_value=mock_proc):
+        findings = engine.scan(str(tmp_path))
+        assert len(findings) == 1
+        assert findings[0].extra.get("test_id") == "B303"
+        assert "B303" in findings[0].title
+        assert engine.stats["findings_count"] == 1
+
+
+def test_bandit_non_ascii_findings_and_evidence(tmp_path):
+    """Verify non-ASCII text in filenames, issue text, and evidence does not raise Unicode errors."""
+    engine = BanditEngine()
+    raw = {
+        "test_id": "B105",
+        "test_name": "hardcoded_password_string",
+        "filename": "données/café.py",
+        "line_number": 1,
+        "issue_severity": "LOW",
+        "issue_confidence": "MEDIUM",
+        "issue_text": "Possible mot de passe secret dans la fonction vérifiée: 'secret123'",
+        "code": "1 pwd = 'secret123'  # vérifié ☕\n",
+    }
+    f = engine._make_finding(raw, tmp_path)
+    assert "café" in f.file
+    assert f.line == 1
+    assert "vérifiée" in f.title
+    assert "vérifié ☕" in f.evidence
+
+
+
+
 
 
