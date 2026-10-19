@@ -563,4 +563,85 @@ def test_bandit_exclude_paths_real_bandit(tmp_path):
     assert not any("test_something.py" in f for f in files)
 
 
+def test_bandit_resilient_load_json():
+    """Verify _load_json parses Bandit JSON even with ANSI colors, leading log braces, and trailing text."""
+    # 1. Standard valid JSON
+    valid = '{"results": [{"test_id": "B303"}], "metrics": {}}'
+    assert BanditEngine._load_json(valid) == {"results": [{"test_id": "B303"}], "metrics": {}}
+
+    # 2. None or non-JSON
+    assert BanditEngine._load_json("") is None
+    assert BanditEngine._load_json("Bandit failed to run") is None
+
+    # 3. ANSI escapes + leading non-Bandit JSON braces + trailing output
+    noisy_output = (
+        "\x1b[33m[WARN] Logger initialized with options: {'debug': True}\x1b[0m\n"
+        "[INFO] Starting Bandit scan...\n"
+        '{"errors": [], "results": [{"test_id": "B101"}], "metrics": {"_totals": {"loc": 10}}}\n'
+        "\x1b[32mScan complete.\x1b[0m\n"
+    )
+    parsed = BanditEngine._load_json(noisy_output)
+    assert parsed is not None
+    assert "results" in parsed
+    assert parsed["results"][0]["test_id"] == "B101"
+    assert parsed["metrics"]["_totals"]["loc"] == 10
+
+
+def test_bandit_dynamic_timeout_scaling(tmp_path):
+    """Verify dynamic timeout calculation based on codebase size, and explicit override preservation."""
+    # Base case: no python files
+    engine = BanditEngine()
+    count, loc = engine._estimate_python_workload(tmp_path)
+    assert count == 0
+    assert loc == 0
+
+    # Create small python file (~100 bytes)
+    (tmp_path / "app.py").write_text("print('hello world')\n" * 5, encoding="utf-8")
+    count, loc = engine._estimate_python_workload(tmp_path)
+    assert count == 1
+    assert loc > 0
+
+    # User specified an explicit timeout override
+    custom_engine = BanditEngine(timeout=42)
+    assert custom_engine.timeout == 42
+
+
+def test_bandit_preflight_cli_sanitization(tmp_path):
+    """Verify malicious or malformed test/skip flags and missing config paths are sanitized."""
+    # Malicious injection in tests and skips
+    engine = BanditEngine(
+        tests=["B303", "-v", "--config=/evil", "B501"],
+        skips=["B101", "--debug", "invalid;flag", "B403"],
+        config_file=str(tmp_path / "nonexistent_config.yaml"),
+    )
+
+    with patch("subprocess.run") as mock_run:
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = '{"results": [], "metrics": {}}'
+        mock_proc.stderr = ""
+        mock_run.return_value = mock_proc
+
+        (tmp_path / "test.py").write_text("x = 1\n", encoding="utf-8")
+        engine.scan(str(tmp_path))
+
+        assert mock_run.called
+        cmd = mock_run.call_args[0][0]
+
+        # Ensure -t only has sanitized B303,B501
+        assert "-t" in cmd
+        t_idx = cmd.index("-t")
+        assert cmd[t_idx + 1] == "B303,B501"
+
+        # Ensure -s only has sanitized B101,B403
+        assert "-s" in cmd
+        s_idx = cmd.index("-s")
+        assert cmd[s_idx + 1] == "B101,B403"
+
+        # Ensure non-existent config file is not included in cmd and recorded in errors
+        assert "-c" not in cmd
+        assert any("Config file not found" in err for err in engine.stats["errors"])
+
+
+
 

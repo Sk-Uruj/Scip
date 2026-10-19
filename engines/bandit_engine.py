@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -661,15 +662,62 @@ class BanditEngine(Engine):
         """Check if Bandit is installed in current Python environment or on PATH."""
         return importlib.util.find_spec("bandit") is not None or shutil.which("bandit") is not None
 
-    def _has_python_files(self, root: Path) -> bool:
+    @classmethod
+    def _load_json(cls, stdout: str) -> Optional[Dict[str, Any]]:
+        """Extract and parse top-level JSON dictionary from process stdout with noise resilience.
+
+        Handles ANSI color sequences, leading logging lines, warning messages, and mixed stdout.
+        """
+        if not stdout or "{" not in stdout:
+            return None
+
+        clean = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", stdout)
+
+        # Fast path: entire clean stdout is valid JSON
+        try:
+            data = json.loads(clean)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+        # Resilient boundary scan using raw_decode across balanced JSON object boundaries
+        decoder = json.JSONDecoder()
+        pos = 0
+        while True:
+            idx = clean.find("{", pos)
+            if idx == -1:
+                break
+            try:
+                obj, _ = decoder.raw_decode(clean, idx)
+                if isinstance(obj, dict) and ("results" in obj or "metrics" in obj or "errors" in obj):
+                    return obj
+                pos = idx + 1
+            except Exception:
+                pos = idx + 1
+
+        return None
+
+    def _estimate_python_workload(self, root: Path) -> Tuple[int, int]:
+        """Estimate Python file count and approximate LOC to calculate dynamic timeout."""
+        count = 0
+        total_bytes = 0
         for p in root.rglob("*.py"):
             try:
                 rel_parts = p.relative_to(root).parts
             except ValueError:
                 rel_parts = p.parts
             if not any(part in SKIP_DIRS for part in rel_parts):
-                return True
-        return False
+                count += 1
+                try:
+                    total_bytes += p.stat().st_size
+                except OSError:
+                    pass
+        approx_loc = total_bytes // 35  # ~35 bytes per line average
+        return count, approx_loc
+
+    def _has_python_files(self, root: Path) -> bool:
+        return self._estimate_python_workload(root)[0] > 0
 
     def scan(self, repo_path: str) -> List[Finding]:
         root = Path(repo_path).resolve()
@@ -691,11 +739,18 @@ class BanditEngine(Engine):
             self.stats.update(skipped=True, note="Bandit package not found")
             return []
 
-        # Fast check if there are any non-ignored Python files to scan
-        if not self._has_python_files(root):
+        # Fast check and workload estimation
+        file_count, approx_loc = self._estimate_python_workload(root)
+        if file_count == 0:
             log.info("No Python files found under %s", root)
             self.stats["files_scanned"] = 0
             return []
+
+        # Scale timeout dynamically for large repositories when default timeout is used
+        if self.timeout == TIMEOUT:
+            effective_timeout = max(TIMEOUT, min(300, 60 + (approx_loc // 10000) * 30))
+        else:
+            effective_timeout = self.timeout
 
         # Run via current Python environment module if available, otherwise fallback to PATH executable
         if importlib.util.find_spec("bandit") is not None:
@@ -706,23 +761,38 @@ class BanditEngine(Engine):
             self.stats.update(skipped=True, note="Bandit executable not found")
             return []
 
-        if self.config_file and os.path.exists(self.config_file):
-            cmd.extend(["-c", str(self.config_file)])
+        if self.config_file:
+            cfg_p = Path(self.config_file)
+            if cfg_p.is_file():
+                cmd.extend(["-c", str(cfg_p.resolve())])
+            else:
+                log.warning("Config file not found: %s", self.config_file)
+                self.stats["errors"].append(f"Config file not found: {self.config_file}")
+
         if self.tests:
-            cmd.extend(["-t", ",".join(self.tests)])
+            valid_tests = [t for t in self.tests if re.match(r"^[A-Za-z0-9_]+$", str(t)) and not str(t).startswith("-")]
+            if valid_tests:
+                cmd.extend(["-t", ",".join(valid_tests)])
+
         if self.skips:
-            cmd.extend(["-s", ",".join(self.skips)])
-            self.stats["skipped_rules"] = list(self.skips)
+            valid_skips = [s for s in self.skips if re.match(r"^[A-Za-z0-9_]+$", str(s)) and not str(s).startswith("-")]
+            if valid_skips:
+                cmd.extend(["-s", ",".join(valid_skips)])
+                self.stats["skipped_rules"] = list(valid_skips)
+
         if self.severity_min:
             flag = {"low": "-l", "medium": "-ll", "high": "-lll"}.get(self.severity_min.lower())
             if flag:
                 cmd.append(flag)
+
         if self.confidence_min:
             flag = {"low": "-i", "medium": "-ii", "high": "-iii"}.get(self.confidence_min.lower())
             if flag:
                 cmd.append(flag)
+
         if self.include_suppressed:
             cmd.append("--ignore-nosec")
+
         if self.exclude_paths:
             sanitized_excludes: List[str] = []
             for p in self.exclude_paths:
@@ -741,7 +811,7 @@ class BanditEngine(Engine):
         # from inadvertently matching exclude_dirs substrings.
         cmd.extend(["--", "."])
 
-        log.info("Running Bandit: %s (cwd=%s)", " ".join(cmd), root)
+        log.info("Running Bandit: %s (cwd=%s, timeout=%ds)", " ".join(cmd), root, effective_timeout)
         try:
             proc = subprocess.run(
                 cmd,
@@ -749,11 +819,11 @@ class BanditEngine(Engine):
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
-            log.warning("Bandit scan timed out after %ds on %s", self.timeout, root)
-            self.stats["errors"].append(f"Timed out after {self.timeout}s")
+            log.warning("Bandit scan timed out after %ds on %s", effective_timeout, root)
+            self.stats["errors"].append(f"Timed out after {effective_timeout}s")
             return []
         except Exception as e:
             log.warning("Failed to invoke Bandit: %s", e)
