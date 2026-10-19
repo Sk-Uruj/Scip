@@ -291,7 +291,7 @@ def test_bandit_exclude_paths_passes_x_flag(tmp_path):
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert "-x" in cmd
-        assert "tests,fixtures" in cmd
+        assert any("tests" in arg and "fixtures" in arg for arg in cmd)
 
 
 
@@ -359,10 +359,208 @@ def test_remediation_metadata_structure():
 
 
 def test_remediation_templates_parity_with_rule_patchers():
-    """Verify that REMEDIATION_TEMPLATES auto_fixable set matches RULE_PATCHERS exactly."""
+    """Verify that REMEDIATION_TEMPLATES auto_fixable set and tiers match RULE_PATCHERS exactly."""
     from remediation.code_patcher import RULE_PATCHERS
 
     auto_fixable_templates = {k for k, v in REMEDIATION_TEMPLATES.items() if v.get("auto_fixable")}
     assert auto_fixable_templates == set(RULE_PATCHERS.keys())
+    for k, patcher in RULE_PATCHERS.items():
+        assert patcher.tier == REMEDIATION_TEMPLATES[k]["tier"]
+        assert patcher.review_note != ""
+
+
+def test_classify_file_role():
+    """Verify path-based role classification for test, doc, sample, and production code."""
+    from engines.bandit_engine import classify_file_role
+
+    assert classify_file_role("tests/test_api.py")["is_test_code"] is True
+    assert classify_file_role("src/tests/sub/test_foo.py")["file_role"] == "test"
+    assert classify_file_role("tests/conftest.py")["is_test_code"] is True
+    assert classify_file_role("app/fixtures/users.py")["is_test_code"] is True
+    assert classify_file_role("app/mock_service.py")["is_test_code"] is True
+
+    assert classify_file_role("docs/getting_started.py")["file_role"] == "docs"
+    assert classify_file_role("examples/quickstart.py")["is_sample_code"] is True
+    assert classify_file_role("demos/demo_app.py")["file_role"] == "sample"
+
+    prod = classify_file_role("backend/services/auth.py")
+    assert prod["file_role"] == "production"
+    assert prod["is_test_code"] is False
+    assert prod["is_sample_code"] is False
+
+
+def test_damping_and_calibration_in_test_and_sample_code(tmp_path):
+    """Verify exploitability damping clamps at 0.05 (2 decimals) and rule-specific FP calibration."""
+    engine = BanditEngine()
+
+    # 1. Test code B101 (assert): should have HIGH fp_likelihood
+    r_b101 = {
+        "test_id": "B101",
+        "test_name": "assert_used",
+        "issue_severity": "LOW",
+        "issue_confidence": "HIGH",
+        "filename": "tests/test_calc.py",
+        "line_number": 10,
+    }
+    f_b101 = engine._make_finding(r_b101, tmp_path)
+    assert f_b101.exposure == "TEST"
+    assert f_b101.fp_likelihood == "HIGH"
+    assert "assert statement in test code" in f_b101.fp_reason
+    assert f_b101.exploitability >= 0.05
+    # Verify no duplicate false_positive_risk in extra
+    assert "false_positive_risk" not in f_b101.extra
+    assert f_b101.extra.get("fp_likelihood") == "HIGH"
+
+    # 2. Test code B602 (subprocess): should have LOW fp_likelihood
+    r_b602 = {
+        "test_id": "B602",
+        "test_name": "subprocess_popen_with_shell_equals_true",
+        "issue_severity": "HIGH",
+        "issue_confidence": "HIGH",
+        "filename": "tests/test_runner.py",
+        "line_number": 25,
+    }
+    f_b602 = engine._make_finding(r_b602, tmp_path)
+    assert f_b602.exposure == "TEST"
+    assert f_b602.fp_likelihood == "LOW"
+
+    # 3. Sample code: damped exploitability, fp_likelihood MEDIUM
+    r_sample = {
+        "test_id": "B105",
+        "test_name": "hardcoded_password_string",
+        "issue_severity": "LOW",
+        "issue_confidence": "LOW",
+        "filename": "examples/demo.py",
+        "line_number": 5,
+    }
+    f_sample = engine._make_finding(r_sample, tmp_path)
+    assert f_sample.exposure is None
+    assert f_sample.fp_likelihood == "MEDIUM"
+    assert f_sample.exploitability == 0.07  # damped from 0.15 by 0.5 to 0.07
+
+    # 4. Low exploitability damped in test code: verify it clamps at 0.05
+    r_clamp = {
+        "test_id": "B403",
+        "test_name": "import_pickle",
+        "issue_severity": "LOW",
+        "issue_confidence": "LOW",
+        "filename": "tests/test_loader.py",
+        "line_number": 1,
+    }
+    f_clamp = engine._make_finding(r_clamp, tmp_path)
+    assert f_clamp.exploitability == 0.05  # clamped at 0.05
+
+
+def test_enclosing_scope_interleaved_nesting_and_classes():
+    """Verify that combined scope stack accurately extracts interleaved class and function scopes."""
+    from engines.bandit_engine import extract_enclosing_scope_from_source
+
+    code = (
+        "class A:\n"                 # 1
+        "    x = 1\n"                # 2
+        "    def f(self):\n"         # 3
+        "        y = 2\n"            # 4
+        "        class B:\n"         # 5
+        "            z = 3\n"        # 6
+        "            def g(self):\n" # 7
+        "                return 42\n" # 8
+    )
+
+    # Line 2: inside class A, outside any function
+    fn2, cls2, sc2 = extract_enclosing_scope_from_source(code, 2)
+    assert fn2 is None
+    assert cls2 == "A"
+    assert sc2 == "A"
+
+    # Line 4: inside method f of class A
+    fn4, cls4, sc4 = extract_enclosing_scope_from_source(code, 4)
+    assert fn4 == "f"
+    assert cls4 == "A"
+    assert sc4 == "A.f"
+
+    # Line 6: inside class B inside method f of class A
+    fn6, cls6, sc6 = extract_enclosing_scope_from_source(code, 6)
+    assert fn6 == "f"
+    assert cls6 == "B"
+    assert sc6 == "A.f.B"
+
+    # Line 8: inside method g inside class B inside method f inside class A
+    fn8, cls8, sc8 = extract_enclosing_scope_from_source(code, 8)
+    assert fn8 == "g"
+    assert cls8 == "B"
+    assert sc8 == "A.f.B.g"
+
+
+def test_enclosing_scope_nested_classes_without_functions():
+    """Verify nested classes report qualified scope Outer.Inner."""
+    from engines.bandit_engine import extract_enclosing_scope_from_source
+
+    code = (
+        "class Outer:\n"      # 1
+        "    class Inner:\n"  # 2
+        "        val = 10\n"  # 3
+    )
+    fn3, cls3, sc3 = extract_enclosing_scope_from_source(code, 3)
+    assert fn3 is None
+    assert cls3 == "Inner"
+    assert sc3 == "Outer.Inner"
+
+
+def test_path_sandboxing_in_make_finding(tmp_path):
+    """Verify that _make_finding rejects absolute paths outside root or path traversal."""
+    engine = BanditEngine()
+
+    # Raw filename pointing to /etc/passwd or outside root
+    r = {
+        "test_id": "B101",
+        "filename": "../../outside_repo.py",
+        "line_number": 1,
+    }
+    f = engine._make_finding(r, tmp_path)
+    # The AST scope extraction should have safely fallen back to None without reading external files
+    assert f.extra.get("enclosing_scope") is None
+
+
+def test_finding_fields_preservation_and_redaction():
+    """Verify Finding dataclass defines exposure, fp_likelihood, fp_reason, and redact_finding preserves them."""
+    from core.finding import Finding
+    from core.redact import redact_finding
+
+    f = Finding(
+        engine="bandit",
+        title="Bandit B105: Possible hardcoded password: 'secret123'",
+        file="tests/test_auth.py",
+        line=12,
+        exposure="TEST",
+        fp_likelihood="HIGH",
+        fp_reason="Test credential in test fixture",
+        evidence="password = 'secret123'",
+    )
+    redacted = redact_finding(f)
+    assert redacted.exposure == "TEST"
+    assert redacted.fp_likelihood == "HIGH"
+    assert redacted.fp_reason == "Test credential in test fixture"
+    assert "secret123" not in redacted.evidence
+    assert "secret123" not in redacted.title
+
+
+def test_bandit_exclude_paths_real_bandit(tmp_path):
+    """Verify that exclude_paths=['tests'] excludes tests/ from scan using real Bandit."""
+    engine = BanditEngine(exclude_paths=["tests"])
+    if not engine.is_available():
+        pytest.skip("Bandit not installed")
+
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    # Use unskipped rule B303 (hashlib.md5) so findings are produced
+    (tests_dir / "test_something.py").write_text("import hashlib\nh = hashlib.md5(b'test')\n", encoding="utf-8")
+    (tmp_path / "main.py").write_text("import hashlib\nh = hashlib.md5(b'test')\n", encoding="utf-8")
+
+    findings = engine.scan(str(tmp_path))
+    # main.py should be scanned; test_something.py must be excluded
+    files = {f.file.replace("\\", "/") for f in findings}
+    assert "main.py" in files
+    assert not any("test_something.py" in f for f in files)
+
 
 

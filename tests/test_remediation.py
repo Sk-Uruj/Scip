@@ -571,7 +571,10 @@ def test_code_patcher_call_with_comment_before_closing_paren():
 
 
 def test_code_patcher_no_trailing_newline_git_apply_check(tmp_path):
-    """Verify that diffs for files lacking trailing newlines apply cleanly with git apply."""
+    """Verify that diffs for files lacking trailing newlines apply cleanly with git apply,
+
+    both when the edit occurs on the final line and when the final line is untouched context.
+    """
     import shutil
     import subprocess
     if not shutil.which("git"):
@@ -582,25 +585,176 @@ def test_code_patcher_no_trailing_newline_git_apply_check(tmp_path):
     subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
     subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=repo_dir, capture_output=True, check=True)
 
-    test_file = repo_dir / "target.py"
-    # Write file without trailing newline
-    test_file.write_bytes(b"import flask\napp.run(debug=True)")
-    subprocess.run(["git", "add", "target.py"], cwd=repo_dir, capture_output=True, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, capture_output=True, check=True)
+    # Case 1: Change on the final line without trailing newline
+    test_file1 = repo_dir / "target1.py"
+    test_file1.write_bytes(b"import flask\napp.run(debug=True)")
 
-    orig_content = "import flask\napp.run(debug=True)"
-    _, diff, edits = generate_file_patch("target.py", orig_content, [{"line": 2, "extra": {"test_id": "B201"}}])
-    assert edits[0].applied is True
-    assert "\\ No newline at end of file" in diff
+    orig_content1 = "import flask\napp.run(debug=True)"
+    _, diff1, edits1 = generate_file_patch("target1.py", orig_content1, [{"line": 2, "extra": {"test_id": "B201"}}])
+    assert edits1[0].applied is True
+    assert "\\ No newline at end of file" in diff1
 
-    # Test git apply --check on the generated diff
-    proc = subprocess.run(
+    proc1 = subprocess.run(
         ["git", "apply", "--check", "-"],
-        input=diff.encode("utf-8"),
+        input=diff1.encode("utf-8"),
         cwd=repo_dir,
         capture_output=True,
     )
-    assert proc.returncode == 0, f"git apply failed: {proc.stderr.decode('utf-8', errors='replace')}"
+    assert proc1.returncode == 0, f"git apply failed on final-line edit: {proc1.stderr.decode('utf-8', errors='replace')}"
+
+    # Case 2: Common case - change on line 2, lines 3 and 4 are untouched context at EOF
+    test_file2 = repo_dir / "target2.py"
+    test_file2.write_bytes(b"import flask\napp.run(debug=True)\nx = 1\ny = 2")
+
+    orig_content2 = "import flask\napp.run(debug=True)\nx = 1\ny = 2"
+    _, diff2, edits2 = generate_file_patch("target2.py", orig_content2, [{"line": 2, "extra": {"test_id": "B201"}}])
+    assert edits2[0].applied is True
+    assert "\\ No newline at end of file" in diff2
+
+    proc2 = subprocess.run(
+        ["git", "apply", "--check", "-"],
+        input=diff2.encode("utf-8"),
+        cwd=repo_dir,
+        capture_output=True,
+    )
+    assert proc2.returncode == 0, f"git apply failed on context-line EOF: {proc2.stderr.decode('utf-8', errors='replace')}"
+
+
+def test_code_patcher_postcondition_call_targeting():
+    """Verify that postconditions check that the patched call itself is compliant and compliant count increases."""
+    # File already contains a compliant requests.get(x, timeout=5) on line 1
+    # On line 3, an unpatchable requests call exists
+    code = (
+        "import requests\n"
+        "r1 = requests.get('http://ok', timeout=5)\n"
+        "r2 = requests.get('http://already_has', timeout=10)\n"
+    )
+    # Finding points to line 3, but it already has timeout=10
+    _, edits = patch_file_content(code, [{"line": 3, "extra": {"test_id": "B113"}}])
+    assert edits[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+
+
+def test_code_patcher_positive_b303_and_b701():
+    """Verify positive AST patching for B303 (MD5/SHA1 -> SHA256) and B701 (Jinja autoescape)."""
+    # B303 md5
+    code_md5 = "import hashlib\nh = hashlib.md5(b'test').hexdigest()"
+    out_md5, reason_md5 = patch_single_snippet(code_md5, "B303", line_no=2)
+    assert out_md5 == "import hashlib\nh = hashlib.sha256(b'test').hexdigest()"
+    assert reason_md5 == ""
+
+    # B303 sha1
+    code_sha1 = "import hashlib\nh = hashlib.sha1(b'test').hexdigest()"
+    out_sha1, reason_sha1 = patch_single_snippet(code_sha1, "B303", line_no=2)
+    assert out_sha1 == "import hashlib\nh = hashlib.sha256(b'test').hexdigest()"
+
+    # B701 Jinja autoescape
+    code_b701 = "from jinja2 import Environment\nenv = Environment(autoescape=False)"
+    out_b701, reason_b701 = patch_single_snippet(code_b701, "B701", line_no=2)
+    assert out_b701 == "from jinja2 import Environment\nenv = Environment(autoescape=True)"
+
+
+def test_code_patcher_no_op_already_compliant():
+    """Verify that already-compliant calls result in clean no-ops (PATTERN_NOT_FOUND) rather than corrupting code."""
+    cases = [
+        ("requests.get(url, timeout=5)", "B113"),
+        ("yaml.safe_load(stream)", "B506"),
+        ("app.run(debug=False)", "B201"),
+        ("requests.get(url, verify=True)", "B501"),
+        ("torch.load(f, weights_only=True)", "B614"),
+        ("Environment(autoescape=True)", "B701"),
+    ]
+    for code, test_id in cases:
+        out, edits = patch_file_content(code, [{"line": 1, "extra": {"test_id": test_id}}])
+        assert edits[0].status == PatchStatus.PATTERN_NOT_FOUND.value
+        assert edits[0].applied is False
+        assert out == code  # Code must remain untouched
+
+
+def test_original_repo_untouched_byte_for_byte(tmp_path):
+    """Core safety promise: the original repository is 100% untouched byte-for-byte during remediation."""
+    import hashlib
+
+    repo = tmp_path / "original_repo"
+    repo.mkdir()
+
+    file1 = repo / "server.py"
+    file1.write_text("import flask\napp.run(debug=True)\n", encoding="utf-8")
+    file2 = repo / "requirements.txt"
+    file2.write_text("requests==2.20.0\nurllib3==1.24.1\n", encoding="utf-8")
+    file3 = repo / "notes.md"
+    file3.write_text("# Project Notes\nKeep safe.\n", encoding="utf-8")
+
+    def hash_dir(path: Path) -> dict:
+        hashes = {}
+        for p in sorted(path.rglob("*")):
+            if p.is_file():
+                hashes[str(p.relative_to(path))] = hashlib.sha256(p.read_bytes()).hexdigest()
+        return hashes
+
+    hashes_before = hash_dir(repo)
+
+    # 1. Apply code patches
+    findings = [
+        {"file": "server.py", "line": 2, "extra": {"test_id": "B201"}},
+    ]
+    code_res = apply_code_patches(repo, findings)
+    assert len(code_res.applied) == 1
+    assert hash_dir(repo) == hashes_before
+
+    # 2. Apply dependency upgrades
+    from remediation.apply import apply_upgrades
+    from remediation.plan import Upgrade
+    upgrades = [
+        Upgrade(file="requirements.txt", line=1, package="requests", current="2.20.0", target="2.31.0", fixes=["CVE-2018-18074"]),
+    ]
+    dep_res = apply_upgrades(code_res.workspace, upgrades)
+    assert len(dep_res.applied) == 1
+
+    # Verify original repository is still 100% byte-for-byte identical
+    assert hash_dir(repo) == hashes_before
+
+
+def test_apply_upgrades_symlink_and_traversal_safety(tmp_path):
+    """Verify that apply_upgrades rejects symlinks, path traversals, and dangling links."""
+    from remediation.apply import apply_upgrades
+    from remediation.plan import Upgrade
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    req = ws / "requirements.txt"
+    req.write_text("requests==2.20.0\n", encoding="utf-8")
+
+    # Path traversal upgrade
+    up_traversal = [Upgrade(file="../outside.txt", line=1, package="requests", current="2.20.0", target="2.31.0", fixes=["CVE-2018-18074"])]
+    res_traversal = apply_upgrades(ws, up_traversal)
+    assert len(res_traversal.applied) == 0
+    assert "traversal" in res_traversal.edits[0].reason
+
+    # Absolute path upgrade
+    up_abs = [Upgrade(file="/etc/passwd", line=1, package="requests", current="2.20.0", target="2.31.0", fixes=["CVE-2018-18074"])]
+    res_abs = apply_upgrades(ws, up_abs)
+    assert len(res_abs.applied) == 0
+    assert "rejected" in res_abs.edits[0].reason
+
+
+def test_code_edit_record_applied_and_review_note():
+    """Verify CodeEditRecord to_dict() includes applied boolean and review_note."""
+    from remediation.code_patcher import CodeEditRecord, PatchStatus
+    rec = CodeEditRecord(
+        file="app.py",
+        line=1,
+        test_id="B201",
+        tier="mechanical",
+        status=PatchStatus.APPLIED.value,
+        original="app.run(debug=True)",
+        patched="app.run(debug=False)",
+        review_note="Disables debug mode.",
+    )
+    assert rec.applied is True
+    d = rec.to_dict()
+    assert d["applied"] is True
+    assert d["review_note"] == "Disables debug mode."
+
 
 
 

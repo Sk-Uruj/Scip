@@ -471,6 +471,61 @@ def classify_file_role(path_str: str) -> Dict[str, Any]:
     }
 
 
+class FileScopeIndex:
+    """Pre-computed scope index for a parsed AST tree, mapping line numbers to enclosing scope."""
+
+    def __init__(self, tree: ast.AST):
+        self._entries: List[Tuple[int, int, int, Optional[str], Optional[str], Optional[str]]] = []
+        self._cache: Dict[int, Tuple[Optional[str], Optional[str], Optional[str]]] = {}
+        self._build_index(tree)
+
+    def _build_index(self, tree: ast.AST) -> None:
+        stack: List[Tuple[str, str]] = []  # (kind, name)
+
+        def walk_node(node: ast.AST) -> None:
+            if isinstance(node, ast.ClassDef):
+                stack.append(("class", node.name))
+                start = node.lineno
+                end = getattr(node, "end_lineno", node.lineno)
+                enc_func = next((name for kind, name in reversed(stack) if kind == "func"), None)
+                enc_cls = next((name for kind, name in reversed(stack) if kind == "class"), None)
+                enc_scope = ".".join(name for _, name in stack)
+                self._entries.append((start, end, end - start, enc_func, enc_cls, enc_scope))
+                for child in ast.iter_child_nodes(node):
+                    walk_node(child)
+                stack.pop()
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.append(("func", node.name))
+                start = node.lineno
+                end = getattr(node, "end_lineno", node.lineno)
+                enc_func = next((name for kind, name in reversed(stack) if kind == "func"), None)
+                enc_cls = next((name for kind, name in reversed(stack) if kind == "class"), None)
+                enc_scope = ".".join(name for _, name in stack)
+                self._entries.append((start, end, end - start, enc_func, enc_cls, enc_scope))
+                for child in ast.iter_child_nodes(node):
+                    walk_node(child)
+                stack.pop()
+            else:
+                for child in ast.iter_child_nodes(node):
+                    walk_node(child)
+
+        walk_node(tree)
+        # Sort by span ascending (smallest span first), then start descending
+        self._entries.sort(key=lambda e: (e[2], -e[0]))
+
+    def get_scope(self, target_line: int) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        if target_line in self._cache:
+            return self._cache[target_line]
+        for start, end, _, enc_func, enc_cls, enc_scope in self._entries:
+            if start <= target_line <= end:
+                res = (enc_func, enc_cls, enc_scope)
+                self._cache[target_line] = res
+                return res
+        res = (None, None, None)
+        self._cache[target_line] = res
+        return res
+
+
 class _EnclosingScopeVisitor(ast.NodeVisitor):
     """AST visitor that finds the innermost enclosing function, class, and qualified scope for a line."""
 
@@ -479,24 +534,22 @@ class _EnclosingScopeVisitor(ast.NodeVisitor):
         self.enclosing_class: Optional[str] = None
         self.enclosing_function: Optional[str] = None
         self.enclosing_scope: Optional[str] = None
-        self._class_stack: List[str] = []
-        self._func_stack: List[str] = []
-        self._smallest_func_span: float = float("inf")
-        self._smallest_class_span: float = float("inf")
+        self._scope_stack: List[Tuple[str, str]] = []
+        self._smallest_span: float = float("inf")
 
     def visit_ClassDef(self, node: ast.ClassDef):
+        self._scope_stack.append(("class", node.name))
         start = node.lineno
         end = getattr(node, "end_lineno", node.lineno)
-        self._class_stack.append(node.name)
         if start <= self.target_line <= end:
             span = end - start
-            if span < self._smallest_class_span:
-                self._smallest_class_span = span
+            if span < self._smallest_span:
+                self._smallest_span = span
                 self.enclosing_class = node.name
-                if not self.enclosing_scope:
-                    self.enclosing_scope = ".".join(self._class_stack)
+                self.enclosing_function = next((name for k, name in reversed(self._scope_stack) if k == "func"), None)
+                self.enclosing_scope = ".".join(name for _, name in self._scope_stack)
         self.generic_visit(node)
-        self._class_stack.pop()
+        self._scope_stack.pop()
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         self._process_func(node)
@@ -505,18 +558,18 @@ class _EnclosingScopeVisitor(ast.NodeVisitor):
         self._process_func(node)
 
     def _process_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        self._scope_stack.append(("func", node.name))
         start = node.lineno
         end = getattr(node, "end_lineno", node.lineno)
-        self._func_stack.append(node.name)
         if start <= self.target_line <= end:
             span = end - start
-            if span < self._smallest_func_span:
-                self._smallest_func_span = span
+            if span < self._smallest_span:
+                self._smallest_span = span
                 self.enclosing_function = node.name
-                scope_parts = list(self._class_stack) + list(self._func_stack)
-                self.enclosing_scope = ".".join(scope_parts)
+                self.enclosing_class = next((name for k, name in reversed(self._scope_stack) if k == "class"), None)
+                self.enclosing_scope = ".".join(name for _, name in self._scope_stack)
         self.generic_visit(node)
-        self._func_stack.pop()
+        self._scope_stack.pop()
 
 
 def extract_enclosing_scope_from_source(
@@ -528,9 +581,8 @@ def extract_enclosing_scope_from_source(
         return None, None, None
     try:
         tree = ast.parse(source_code)
-        visitor = _EnclosingScopeVisitor(line_number)
-        visitor.visit(tree)
-        return visitor.enclosing_function, visitor.enclosing_class, visitor.enclosing_scope
+        index = FileScopeIndex(tree)
+        return index.get_scope(line_number)
     except Exception:
         return None, None, None
 
@@ -538,11 +590,12 @@ def extract_enclosing_scope_from_source(
 def extract_enclosing_scope(
     file_path: Path | str,
     line_number: Optional[int],
-    ast_cache: Optional[Dict[str, Optional[ast.AST]]] = None,
+    ast_cache: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Extract (enclosing_function, enclosing_class, enclosing_scope) for a given file and line number.
 
     Returns (None, None, None) if file cannot be read/parsed or line is outside any scope.
+    Uses pre-built FileScopeIndex to avoid re-walking AST for multiple findings in the same file.
     """
     if not line_number or line_number <= 0:
         return None, None, None
@@ -550,9 +603,9 @@ def extract_enclosing_scope(
     path_obj = Path(file_path)
     path_key = str(path_obj.resolve()) if path_obj.exists() else str(file_path)
 
-    tree: Optional[ast.AST] = None
+    scope_index: Optional[FileScopeIndex] = None
     if ast_cache is not None and path_key in ast_cache:
-        tree = ast_cache[path_key]
+        scope_index = ast_cache[path_key]
     else:
         if path_obj.exists() and path_obj.is_file():
             try:
@@ -563,21 +616,16 @@ def extract_enclosing_scope(
                     with open(path_obj, "r", encoding="utf-8", errors="ignore") as f:
                         source = f.read()
                 tree = ast.parse(source, filename=str(path_obj))
+                scope_index = FileScopeIndex(tree)
             except Exception:
-                tree = None
+                scope_index = None
         if ast_cache is not None:
-            ast_cache[path_key] = tree
+            ast_cache[path_key] = scope_index
 
-    if tree is None:
+    if scope_index is None:
         return None, None, None
 
-    visitor = _EnclosingScopeVisitor(line_number)
-    try:
-        visitor.visit(tree)
-    except Exception:
-        return None, None, None
-
-    return visitor.enclosing_function, visitor.enclosing_class, visitor.enclosing_scope
+    return scope_index.get_scope(line_number)
 
 
 class BanditEngine(Engine):
@@ -676,7 +724,17 @@ class BanditEngine(Engine):
         if self.include_suppressed:
             cmd.append("--ignore-nosec")
         if self.exclude_paths:
-            cmd.extend(["-x", ",".join(self.exclude_paths)])
+            sanitized_excludes: List[str] = []
+            for p in self.exclude_paths:
+                clean_p = str(p).strip()
+                if not clean_p or clean_p.startswith("-"):
+                    continue
+                sanitized_excludes.append(clean_p)
+                # If bare directory, also append ./ prefix so Bandit discovery on target '.' excludes it
+                if not clean_p.startswith(("./", ".\\", "*", "/", "\\")) and ":" not in clean_p:
+                    sanitized_excludes.append(f"./{clean_p}")
+            if sanitized_excludes:
+                cmd.extend(["-x", ",".join(sanitized_excludes)])
 
         # Pass target path with '--' to prevent flag injection.
         # Run with cwd=root and relative target '.' to prevent parent directories (e.g. /env/)
@@ -787,27 +845,39 @@ class BanditEngine(Engine):
         exposure: Optional[str] = None
 
         if is_test:
-            exploitability = max(0.01, round(exploitability * 0.3, 3))
-            fp_likelihood = "MEDIUM"
-            fp_reason = "Test or test fixture code context"
+            exploitability = max(0.05, round(exploitability * 0.3, 2))
             exposure = "TEST"
+            if test_id == "B101":
+                fp_likelihood = "HIGH"
+                fp_reason = "assert statement in test code is standard practice"
+            elif test_id in {"B105", "B106", "B107", "B108", "B311"}:
+                fp_likelihood = "MEDIUM"
+                fp_reason = "Test fixture or mock data context"
+            elif test_id in {"B602", "B608"}:
+                fp_likelihood = "LOW"
+                fp_reason = "Command or SQL execution in test code"
+            else:
+                fp_likelihood = "MEDIUM"
+                fp_reason = "Test or test fixture code context"
         elif is_sample:
-            exploitability = max(0.01, round(exploitability * 0.5, 3))
+            exploitability = max(0.05, round(exploitability * 0.5, 2))
             fp_likelihood = "MEDIUM"
             fp_reason = "Sample or documentation code context"
 
         # AST enclosing scope extraction (Phase 5)
+        # Sandbox: resolve path and require it to remain strictly within root before reading AST
         full_path: Optional[Path] = None
         if raw_filename:
-            raw_p = Path(raw_filename)
-            if raw_p.is_absolute() and raw_p.exists():
-                full_path = raw_p
-            else:
-                candidate = root / normalized_file
-                if candidate.exists():
-                    full_path = candidate
-                elif (root / raw_filename).exists():
-                    full_path = root / raw_filename
+            try:
+                candidate = Path(raw_filename)
+                if not candidate.is_absolute():
+                    candidate = root / candidate
+                resolved = candidate.resolve()
+                resolved.relative_to(root.resolve())
+                if resolved.is_file():
+                    full_path = resolved
+            except (ValueError, OSError):
+                full_path = None
 
         enc_func: Optional[str] = None
         enc_class: Optional[str] = None
@@ -843,7 +913,6 @@ class BanditEngine(Engine):
         }
         if fp_likelihood is not None:
             extra_dict["fp_likelihood"] = fp_likelihood
-            extra_dict["false_positive_risk"] = fp_likelihood
             extra_dict["fp_reason"] = fp_reason
         if exposure is not None:
             extra_dict["exposure"] = exposure

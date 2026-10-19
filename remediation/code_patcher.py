@@ -60,13 +60,16 @@ class CodeEditRecord:
     original: str = ""
     patched: str = ""
     reason: str = ""
+    review_note: str = ""
 
     @property
     def applied(self) -> bool:
         return self.status == PatchStatus.APPLIED.value
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["applied"] = self.applied
+        return d
 
 
 @dataclass
@@ -141,7 +144,7 @@ def get_node_span(src: str, node: ast.AST) -> Tuple[int, int]:
 
 
 def format_unified_diff(original: str, patched: str, rel_path: str) -> str:
-    """Generate a clean unified diff, properly handling missing trailing newlines."""
+    """Generate a clean unified diff, properly handling missing trailing newlines on context and edit lines."""
     orig_has_nl = original.endswith(("\n", "\r"))
     patched_has_nl = patched.endswith(("\n", "\r"))
 
@@ -162,18 +165,40 @@ def format_unified_diff(original: str, patched: str, rel_path: str) -> str:
     if not diff_lines:
         return ""
 
+    total_orig = len(norm_orig)
+    total_patched = len(norm_patched)
+
+    cur_orig = 0
+    cur_patched = 0
     res: List[str] = []
-    for i, l in enumerate(diff_lines):
+
+    for l in diff_lines:
+        if l.startswith("---") or l.startswith("+++"):
+            res.append(l)
+            continue
+        if l.startswith("@@"):
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", l)
+            if m:
+                cur_orig = int(m.group(1)) - 1
+                cur_patched = int(m.group(2)) - 1
+            res.append(l)
+            continue
+
         res.append(l)
-        is_last = (i == len(diff_lines) - 1) or (
-            i + 1 < len(diff_lines) and diff_lines[i + 1].startswith(("@@", "---"))
-        )
-        if not orig_has_nl and l.startswith("-") and not l.startswith("---") and (
-            is_last or (i + 1 < len(diff_lines) and diff_lines[i + 1].startswith("+"))
-        ):
-            res.append("\\ No newline at end of file\n")
-        elif not patched_has_nl and l.startswith("+") and not l.startswith("+++") and is_last:
-            res.append("\\ No newline at end of file\n")
+        if l.startswith("-"):
+            cur_orig += 1
+            if not orig_has_nl and cur_orig == total_orig:
+                res.append("\\ No newline at end of file\n")
+        elif l.startswith("+"):
+            cur_patched += 1
+            if not patched_has_nl and cur_patched == total_patched:
+                res.append("\\ No newline at end of file\n")
+        elif l.startswith(" "):
+            cur_orig += 1
+            cur_patched += 1
+            if not orig_has_nl and not patched_has_nl and cur_orig == total_orig and cur_patched == total_patched:
+                res.append("\\ No newline at end of file\n")
+
     return "".join(res)
 
 
@@ -193,7 +218,13 @@ def _patch_b201_flask_debug(src: str, call_node: ast.Call) -> Tuple[Optional[str
 def _insert_call_kwarg(src: str, call_node: ast.Call, kwarg_str: str) -> str:
     """Safely insert a keyword argument into an ast.Call node without regex mangling or comment corruption."""
     start, end = get_node_span(src, call_node)
-    all_args = sorted(list(call_node.args) + list(call_node.keywords), key=lambda n: (n.lineno, n.col_offset))
+    # Python 3.8 compatibility: ast.keyword may not have lineno or col_offset
+    call_line = getattr(call_node, "lineno", 0)
+    call_col = getattr(call_node, "col_offset", 0)
+    all_args = sorted(
+        list(call_node.args) + list(call_node.keywords),
+        key=lambda n: (getattr(n, "lineno", call_line), getattr(n, "col_offset", call_col)),
+    )
     if not all_args:
         call_text = src[start:end]
         paren_idx = call_text.rfind(")")
@@ -205,11 +236,27 @@ def _insert_call_kwarg(src: str, call_node: ast.Call, kwarg_str: str) -> str:
     _, last_end = get_node_span(src, last_arg)
     between = src[last_end:end]
 
+    lines = split_python_lines(src)
+    arg_lineno = getattr(last_arg, "lineno", call_line)
+    last_line = lines[arg_lineno - 1] if 0 <= arg_lineno - 1 < len(lines) else ""
+    indent = last_line[: len(last_line) - len(last_line.lstrip())]
+
     # Detect comment in `between`
     hash_idx = between.find("#")
     if hash_idx != -1:
         prefix = between[:hash_idx]
         suffix = between[hash_idx:]
+        if "\n" in suffix or "\r" in suffix:
+            nl = "\r\n" if "\r\n" in suffix else "\n"
+            paren_in_suf = suffix.rfind(")")
+            if paren_in_suf != -1:
+                if "," not in prefix:
+                    prefix = "," + prefix
+                suf_before_paren = suffix[:paren_in_suf]
+                suf_paren = suffix[paren_in_suf:]
+                kw_line = indent + kwarg_str + nl if indent else "    " + kwarg_str + nl
+                new_between = prefix + suf_before_paren + kw_line + suf_paren
+                return src[:last_end] + new_between + src[end:]
         if "," in prefix:
             comma_idx = prefix.rfind(",")
             new_prefix = prefix[: comma_idx + 1] + " " + kwarg_str + prefix[comma_idx + 1 :]
@@ -222,12 +269,22 @@ def _insert_call_kwarg(src: str, call_node: ast.Call, kwarg_str: str) -> str:
             paren_idx = len(between)
         prefix = between[:paren_idx]
         suffix = between[paren_idx:]
-        if "," in prefix:
-            comma_idx = prefix.rfind(",")
-            new_prefix = prefix[: comma_idx + 1] + " " + kwarg_str + prefix[comma_idx + 1 :]
+        if "\n" in prefix or "\r" in prefix:
+            nl = "\r\n" if "\r\n" in prefix else "\n"
+            if "," in prefix:
+                comma_idx = prefix.rfind(",")
+                after_comma = prefix[comma_idx + 1 :]
+                new_prefix = prefix[: comma_idx + 1] + nl + indent + kwarg_str + "," + after_comma
+            else:
+                new_prefix = "," + nl + indent + kwarg_str + prefix
+            return src[:last_end] + new_prefix + suffix + src[end:]
         else:
-            new_prefix = prefix + ", " + kwarg_str
-        return src[:last_end] + new_prefix + suffix + src[end:]
+            if "," in prefix:
+                comma_idx = prefix.rfind(",")
+                new_prefix = prefix[: comma_idx + 1] + " " + kwarg_str + prefix[comma_idx + 1 :]
+            else:
+                new_prefix = prefix + ", " + kwarg_str
+            return src[:last_end] + new_prefix + suffix + src[end:]
 
 
 def _patch_b113_requests_timeout(src: str, call_node: ast.Call) -> Tuple[Optional[str], str]:
@@ -311,6 +368,7 @@ class RulePatcher:
     patch_fn: Callable[[str, ast.Call], Tuple[Optional[str], str]]
     call_filter: Callable[[ast.Call], bool]
     postcondition: Optional[Callable[[ast.Call], bool]] = None
+    review_note: str = ""
 
 
 def _is_flask_run_call(node: ast.Call) -> bool:
@@ -432,6 +490,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b201_flask_debug,
         call_filter=_is_flask_run_call,
         postcondition=_post_b201,
+        review_note="Disabling debug mode prevents interactive debugger execution and stack trace exposure.",
     ),
     "B113": RulePatcher(
         test_id="B113",
@@ -440,6 +499,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b113_requests_timeout,
         call_filter=_is_requests_call,
         postcondition=_post_b113,
+        review_note="Verify that 10 seconds is an appropriate timeout duration for this HTTP endpoint.",
     ),
     "B506": RulePatcher(
         test_id="B506",
@@ -448,6 +508,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b506_yaml_load,
         call_filter=_is_yaml_load_call,
         postcondition=_post_b506,
+        review_note="Verify that custom YAML constructors or Python object serialization are not required.",
     ),
     "B303": RulePatcher(
         test_id="B303",
@@ -456,6 +517,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b303_hashlib,
         call_filter=_is_hashlib_call,
         postcondition=_post_b303,
+        review_note="Verify that SHA-256 digest length (64 hex characters) does not violate database column lengths or protocol requirements.",
     ),
     "B501": RulePatcher(
         test_id="B501",
@@ -464,6 +526,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b501_verify_true,
         call_filter=_is_requests_or_verify_call,
         postcondition=_post_b501,
+        review_note="Verify that the target server presents a valid CA-signed certificate before enabling verification.",
     ),
     "B614": RulePatcher(
         test_id="B614",
@@ -472,6 +535,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b614_torch_load,
         call_filter=_is_torch_load_call,
         postcondition=_post_b614,
+        review_note="Verify that PyTorch model loading does not depend on arbitrary Python object unpickling.",
     ),
     "B701": RulePatcher(
         test_id="B701",
@@ -480,6 +544,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         patch_fn=_patch_b701_jinja2_autoescape,
         call_filter=_is_jinja2_autoescape_call,
         postcondition=_post_b701,
+        review_note="Verify that enabling autoescape does not double-escape pre-sanitized template outputs.",
     ),
 }
 
@@ -525,6 +590,23 @@ def _extract_file(finding: Union[Finding, Dict[str, Any]]) -> str:
     return ""
 
 
+def _extract_col(finding: Union[Finding, Dict[str, Any]]) -> Optional[int]:
+    """Safely extract 0-indexed column offset from finding, coerced to int."""
+    raw_col = None
+    if isinstance(finding, Finding):
+        raw_col = (finding.extra or {}).get("col_offset")
+    elif isinstance(finding, dict):
+        raw_col = (finding.get("extra") or {}).get("col_offset")
+        if raw_col is None:
+            raw_col = finding.get("col_offset")
+    if raw_col is not None:
+        try:
+            return int(raw_col)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def can_auto_patch(finding: Union[Finding, Dict[str, Any]]) -> bool:
     """Return True if this finding has an automated code fix available in RULE_PATCHERS."""
     test_id = _extract_test_id(finding)
@@ -537,7 +619,8 @@ def safe_resolve_target(workspace: Path, rel_f: str) -> Tuple[Optional[Path], st
     raw_str = str(rel_f).strip()
 
     # Reject absolute paths (POSIX leading slash or Windows drive letters)
-    if raw_str.startswith(("/", "\\")) or ":" in raw_str:
+    # Allows legal POSIX filenames containing ':' while forbidding Windows drive letters or alternate data streams
+    if raw_str.startswith(("/", "\\")) or bool(re.match(r"^[A-Za-z]:", raw_str)) or (os.name == "nt" and ":" in raw_str):
         return None, f"Absolute or drive-qualified path rejected: {rel_f}"
 
     cleaned_p = Path(raw_str)
@@ -598,9 +681,13 @@ def patch_file_content(
     current_content = content
     edits: List[CodeEditRecord] = []
 
-    # Process findings in descending line order so multi-line collapses at line N
-    # never invalidate line numbers or AST spans of preceding lines (< N).
-    sorted_findings = sorted(findings, key=lambda f: (_extract_line(f) or 0), reverse=True)
+    # Process findings in descending line order and descending col_offset so multi-line collapses at line N
+    # or edits at column C never invalidate line numbers (< N) or AST spans of preceding columns (< C).
+    sorted_findings = sorted(
+        findings,
+        key=lambda f: (_extract_line(f) or 0, _extract_col(f) or 0),
+        reverse=True,
+    )
 
     for f in sorted_findings:
         test_id = _extract_test_id(f)
@@ -629,6 +716,7 @@ def patch_file_content(
                     tier=patcher.tier,
                     status=PatchStatus.INVALID_LINE.value,
                     reason=f"Invalid line number {line_no}",
+                    review_note=patcher.review_note,
                 )
             )
             continue
@@ -645,6 +733,7 @@ def patch_file_content(
                     tier=patcher.tier,
                     status=PatchStatus.SYNTAX_ERROR.value,
                     reason=f"Unexpected syntax error: {e}",
+                    review_note=patcher.review_note,
                 )
             )
             continue
@@ -658,15 +747,13 @@ def patch_file_content(
                     if patcher.call_filter(node):
                         candidate_calls.append(node)
 
-        # Disambiguate using finding's col_offset if available
-        finding_col_byte = None
-        if isinstance(f, Finding):
-            finding_col_byte = (f.extra or {}).get("col_offset")
-        elif isinstance(f, dict):
-            finding_col_byte = (f.get("extra") or {}).get("col_offset")
-            if finding_col_byte is None:
-                finding_col_byte = f.get("col_offset")
+        # Prioritize calls starting on the exact target line before falling back to multi-line enclosing calls
+        exact_line_calls = [c for c in candidate_calls if c.lineno == line_no]
+        if exact_line_calls:
+            candidate_calls = exact_line_calls
 
+        # Disambiguate using finding's col_offset if available
+        finding_col_byte = _extract_col(f)
         if finding_col_byte is not None and candidate_calls:
             candidate_calls.sort(key=lambda c: abs(c.col_offset - finding_col_byte))
 
@@ -694,6 +781,7 @@ def patch_file_content(
                     tier=patcher.tier,
                     status=PatchStatus.PATTERN_NOT_FOUND.value,
                     reason=patch_reason or f"No matching call found for rule {test_id} on line {line_no}",
+                    review_note=patcher.review_note,
                 )
             )
             continue
@@ -710,19 +798,27 @@ def patch_file_content(
                     tier=patcher.tier,
                     status=PatchStatus.SYNTAX_ERROR.value,
                     reason=f"Patched code introduced syntax error: {e}",
+                    review_note=patcher.review_note,
                 )
             )
             continue
 
         # Safety Net 2: Verify postcondition (e.g. timeout actually present in AST, not in comment)
         if patcher.postcondition is not None:
-            passed_post = False
-            for node in ast.walk(new_tree):
-                if isinstance(node, ast.Call):
-                    if patcher.postcondition(node):
-                        passed_post = True
-                        break
-            if not passed_post:
+            before_compliant_count = sum(
+                1 for node in ast.walk(tree) if isinstance(node, ast.Call) and patcher.postcondition(node)
+            )
+            after_compliant_count = sum(
+                1 for node in ast.walk(new_tree) if isinstance(node, ast.Call) and patcher.postcondition(node)
+            )
+            # Verify the call at the patched span is compliant
+            matching_new_calls = [
+                n for n in ast.walk(new_tree)
+                if isinstance(n, ast.Call) and n.lineno <= line_no <= getattr(n, "end_lineno", n.lineno)
+            ]
+            has_matching_compliant = any(patcher.postcondition(n) for n in matching_new_calls)
+
+            if after_compliant_count != before_compliant_count + 1 or not has_matching_compliant:
                 edits.append(
                     CodeEditRecord(
                         file=file_rel_path,
@@ -730,7 +826,8 @@ def patch_file_content(
                         test_id=test_id,
                         tier=patcher.tier,
                         status=PatchStatus.PATTERN_NOT_FOUND.value,
-                        reason=f"Postcondition failed for rule {test_id}: fix was not properly reflected in AST",
+                        reason=f"Postcondition failed for rule {test_id}: compliant call count did not increase by 1 or patched call at line {line_no} does not satisfy postcondition",
+                        review_note=patcher.review_note,
                     )
                 )
                 continue
@@ -752,6 +849,7 @@ def patch_file_content(
                 original=orig_line_str,
                 patched=new_line_str,
                 reason="",
+                review_note=patcher.review_note,
             )
         )
 
