@@ -17,7 +17,9 @@ from __future__ import annotations
 import ast
 import difflib
 import logging
+import os
 import re
+import stat
 import tokenize
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -109,37 +111,70 @@ def split_python_lines(text: str) -> List[str]:
     return lines
 
 
+def byte_col_to_char_col(line: str, byte_offset: int) -> int:
+    """Convert UTF-8 byte offset to unicode character index for a line."""
+    if byte_offset <= 0:
+        return 0
+    return len(line.encode("utf-8")[:byte_offset].decode("utf-8", errors="ignore"))
+
+
 def get_node_span(src: str, node: ast.AST) -> Tuple[int, int]:
-    """Convert AST node line and column offsets to absolute character index span."""
+    """Convert AST node line and column byte offsets to absolute character index span."""
     lines = split_python_lines(src)
     line_starts = [0]
     for l in lines:
         line_starts.append(line_starts[-1] + len(l))
 
-    # node.lineno is 1-indexed, col_offset is 0-indexed
-    start = line_starts[node.lineno - 1] + node.col_offset
-    end = line_starts[getattr(node, "end_lineno", node.lineno) - 1] + getattr(
-        node, "end_col_offset", node.col_offset
-    )
+    start_line_idx = node.lineno - 1
+    start_line_text = lines[start_line_idx] if 0 <= start_line_idx < len(lines) else ""
+    start_char_col = byte_col_to_char_col(start_line_text, node.col_offset)
+    start = line_starts[start_line_idx] + start_char_col
+
+    end_lineno = getattr(node, "end_lineno", node.lineno)
+    end_line_idx = end_lineno - 1
+    end_line_text = lines[end_line_idx] if 0 <= end_line_idx < len(lines) else ""
+    end_byte_col = getattr(node, "end_col_offset", node.col_offset)
+    end_char_col = byte_col_to_char_col(end_line_text, end_byte_col)
+    end = line_starts[end_line_idx] + end_char_col
+
     return start, end
 
 
 def format_unified_diff(original: str, patched: str, rel_path: str) -> str:
     """Generate a clean unified diff, properly handling missing trailing newlines."""
+    orig_has_nl = original.endswith(("\n", "\r"))
+    patched_has_nl = patched.endswith(("\n", "\r"))
+
     orig_lines = split_python_lines(original)
     patched_lines = split_python_lines(patched)
 
     norm_orig = [l if l.endswith(("\n", "\r")) else l + "\n" for l in orig_lines]
     norm_patched = [l if l.endswith(("\n", "\r")) else l + "\n" for l in patched_lines]
 
-    diff_iter = difflib.unified_diff(
-        norm_orig,
-        norm_patched,
-        fromfile=f"a/{rel_path}",
-        tofile=f"b/{rel_path}",
+    diff_lines = list(
+        difflib.unified_diff(
+            norm_orig,
+            norm_patched,
+            fromfile=f"a/{rel_path}",
+            tofile=f"b/{rel_path}",
+        )
     )
-    diff_text = "".join(diff_iter)
-    return diff_text
+    if not diff_lines:
+        return ""
+
+    res: List[str] = []
+    for i, l in enumerate(diff_lines):
+        res.append(l)
+        is_last = (i == len(diff_lines) - 1) or (
+            i + 1 < len(diff_lines) and diff_lines[i + 1].startswith(("@@", "---"))
+        )
+        if not orig_has_nl and l.startswith("-") and not l.startswith("---") and (
+            is_last or (i + 1 < len(diff_lines) and diff_lines[i + 1].startswith("+"))
+        ):
+            res.append("\\ No newline at end of file\n")
+        elif not patched_has_nl and l.startswith("+") and not l.startswith("+++") and is_last:
+            res.append("\\ No newline at end of file\n")
+    return "".join(res)
 
 
 # --------------------------------------------------------------------------- #
@@ -156,23 +191,43 @@ def _patch_b201_flask_debug(src: str, call_node: ast.Call) -> Tuple[Optional[str
 
 
 def _insert_call_kwarg(src: str, call_node: ast.Call, kwarg_str: str) -> str:
-    """Safely insert a keyword argument into an ast.Call node without regex mangling."""
+    """Safely insert a keyword argument into an ast.Call node without regex mangling or comment corruption."""
     start, end = get_node_span(src, call_node)
-    all_args = list(call_node.args) + list(call_node.keywords)
+    all_args = sorted(list(call_node.args) + list(call_node.keywords), key=lambda n: (n.lineno, n.col_offset))
     if not all_args:
+        call_text = src[start:end]
+        paren_idx = call_text.rfind(")")
+        if paren_idx != -1:
+            return src[: start + paren_idx] + kwarg_str + src[start + paren_idx :]
         return src[: end - 1] + kwarg_str + src[end - 1 :]
 
     last_arg = all_args[-1]
     _, last_end = get_node_span(src, last_arg)
-    between = src[last_end : end - 1]
+    between = src[last_end:end]
 
-    if "," in between:
-        idx = between.rfind(",")
-        new_between = between[: idx + 1] + " " + kwarg_str + between[idx + 1 :]
+    # Detect comment in `between`
+    hash_idx = between.find("#")
+    if hash_idx != -1:
+        prefix = between[:hash_idx]
+        suffix = between[hash_idx:]
+        if "," in prefix:
+            comma_idx = prefix.rfind(",")
+            new_prefix = prefix[: comma_idx + 1] + " " + kwarg_str + prefix[comma_idx + 1 :]
+        else:
+            new_prefix = ", " + kwarg_str + " " if prefix.strip() == "" else prefix.rstrip() + ", " + kwarg_str + " "
+        return src[:last_end] + new_prefix + suffix + src[end:]
     else:
-        new_between = ", " + kwarg_str + between
-
-    return src[:last_end] + new_between + src[end - 1 :]
+        paren_idx = between.rfind(")")
+        if paren_idx == -1:
+            paren_idx = len(between)
+        prefix = between[:paren_idx]
+        suffix = between[paren_idx:]
+        if "," in prefix:
+            comma_idx = prefix.rfind(",")
+            new_prefix = prefix[: comma_idx + 1] + " " + kwarg_str + prefix[comma_idx + 1 :]
+        else:
+            new_prefix = prefix + ", " + kwarg_str
+        return src[:last_end] + new_prefix + suffix + src[end:]
 
 
 def _patch_b113_requests_timeout(src: str, call_node: ast.Call) -> Tuple[Optional[str], str]:
@@ -255,6 +310,7 @@ class RulePatcher:
     description: str
     patch_fn: Callable[[str, ast.Call], Tuple[Optional[str], str]]
     call_filter: Callable[[ast.Call], bool]
+    postcondition: Optional[Callable[[ast.Call], bool]] = None
 
 
 def _is_flask_run_call(node: ast.Call) -> bool:
@@ -270,6 +326,12 @@ def _is_requests_call(node: ast.Call) -> bool:
             if isinstance(node.func.value, ast.Attribute) and node.func.value.attr in {"requests", "session"}:
                 return True
     return False
+
+
+def _is_requests_or_verify_call(node: ast.Call) -> bool:
+    if any(kw.arg == "verify" for kw in node.keywords):
+        return True
+    return _is_requests_call(node)
 
 
 def _is_yaml_load_call(node: ast.Call) -> bool:
@@ -299,8 +361,66 @@ def _is_torch_load_call(node: ast.Call) -> bool:
     )
 
 
-def _is_any_call(node: ast.Call) -> bool:
-    return True
+def _is_jinja2_autoescape_call(node: ast.Call) -> bool:
+    if any(kw.arg == "autoescape" for kw in node.keywords):
+        return True
+    if isinstance(node.func, ast.Name) and "Environment" in node.func.id:
+        return True
+    if isinstance(node.func, ast.Attribute) and "Environment" in node.func.attr:
+        return True
+    return False
+
+
+def _post_b201(call: ast.Call) -> bool:
+    for kw in call.keywords:
+        if kw.arg == "debug":
+            return isinstance(kw.value, ast.Constant) and kw.value.value is False
+    return False
+
+
+def _post_b113(call: ast.Call) -> bool:
+    return any(kw.arg == "timeout" for kw in call.keywords)
+
+
+def _post_b506(call: ast.Call) -> bool:
+    is_safe = (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "safe_load"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "yaml"
+    )
+    no_loader = not any(kw.arg == "Loader" for kw in call.keywords)
+    return is_safe and no_loader
+
+
+def _post_b303(call: ast.Call) -> bool:
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "sha256"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "hashlib"
+    )
+
+
+def _post_b501(call: ast.Call) -> bool:
+    for kw in call.keywords:
+        if kw.arg == "verify":
+            return isinstance(kw.value, ast.Constant) and kw.value.value is True
+    return False
+
+
+def _post_b614(call: ast.Call) -> bool:
+    return any(
+        kw.arg == "weights_only" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+        for kw in call.keywords
+    )
+
+
+def _post_b701(call: ast.Call) -> bool:
+    for kw in call.keywords:
+        if kw.arg == "autoescape":
+            return isinstance(kw.value, ast.Constant) and kw.value.value is True
+    return False
 
 
 # Single authoritative registry of auto-patchable rules
@@ -311,6 +431,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         description="Disable debug mode in Flask app.run().",
         patch_fn=_patch_b201_flask_debug,
         call_filter=_is_flask_run_call,
+        postcondition=_post_b201,
     ),
     "B113": RulePatcher(
         test_id="B113",
@@ -318,6 +439,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         description="Add timeout=10 parameter to requests call.",
         patch_fn=_patch_b113_requests_timeout,
         call_filter=_is_requests_call,
+        postcondition=_post_b113,
     ),
     "B506": RulePatcher(
         test_id="B506",
@@ -325,6 +447,7 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         description="Replace unsafe yaml.load() with yaml.safe_load().",
         patch_fn=_patch_b506_yaml_load,
         call_filter=_is_yaml_load_call,
+        postcondition=_post_b506,
     ),
     "B303": RulePatcher(
         test_id="B303",
@@ -332,13 +455,15 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         description="Replace MD5/SHA1 hash with SHA-256.",
         patch_fn=_patch_b303_hashlib,
         call_filter=_is_hashlib_call,
+        postcondition=_post_b303,
     ),
     "B501": RulePatcher(
         test_id="B501",
         tier=PatchTier.NEEDS_REVIEW.value,
         description="Enable TLS certificate verification on HTTPS request.",
         patch_fn=_patch_b501_verify_true,
-        call_filter=_is_any_call,
+        call_filter=_is_requests_or_verify_call,
+        postcondition=_post_b501,
     ),
     "B614": RulePatcher(
         test_id="B614",
@@ -346,13 +471,15 @@ RULE_PATCHERS: Dict[str, RulePatcher] = {
         description="Specify weights_only=True in torch.load().",
         patch_fn=_patch_b614_torch_load,
         call_filter=_is_torch_load_call,
+        postcondition=_post_b614,
     ),
     "B701": RulePatcher(
         test_id="B701",
         tier=PatchTier.NEEDS_REVIEW.value,
         description="Enable autoescape=True in Jinja2 environment.",
         patch_fn=_patch_b701_jinja2_autoescape,
-        call_filter=_is_any_call,
+        call_filter=_is_jinja2_autoescape_call,
+        postcondition=_post_b701,
     ),
 }
 
@@ -413,21 +540,27 @@ def safe_resolve_target(workspace: Path, rel_f: str) -> Tuple[Optional[Path], st
     if raw_str.startswith(("/", "\\")) or ":" in raw_str:
         return None, f"Absolute or drive-qualified path rejected: {rel_f}"
 
-    cleaned = Path(raw_str).as_posix()
+    cleaned_p = Path(raw_str)
+    if any(p == ".." for p in cleaned_p.parts):
+        return None, f"Path traversal rejected: {rel_f}"
 
-    # Resolve target
-    target = (ws / cleaned).resolve()
+    # Walk components with os.lstat BEFORE resolving symlinks
+    cur = ws
+    for part in cleaned_p.parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+            if stat.S_ISLNK(st.st_mode):
+                return None, f"Symlink rejected: {cur}"
+        except (FileNotFoundError, OSError):
+            pass
+
+    # Now resolve target and ensure it remains strictly inside workspace
+    target = cur.resolve()
     try:
         target.relative_to(ws)
     except ValueError:
         return None, f"Path escapes workspace: {rel_f}"
-
-    # Reject symlinks inside the workspace
-    cur = target
-    while cur != ws and cur != cur.parent:
-        if cur.is_symlink():
-            return None, f"Symlink traversal rejected: {cur}"
-        cur = cur.parent
 
     return target, ""
 
@@ -465,8 +598,9 @@ def patch_file_content(
     current_content = content
     edits: List[CodeEditRecord] = []
 
-    # Sort findings by line number ascending
-    sorted_findings = sorted(findings, key=lambda f: (_extract_line(f) or 0))
+    # Process findings in descending line order so multi-line collapses at line N
+    # never invalidate line numbers or AST spans of preceding lines (< N).
+    sorted_findings = sorted(findings, key=lambda f: (_extract_line(f) or 0), reverse=True)
 
     for f in sorted_findings:
         test_id = _extract_test_id(f)
@@ -515,17 +649,43 @@ def patch_file_content(
             )
             continue
 
-        # Find matching Call node on target line
-        matching_call = None
+        # Collect candidate Call nodes on target line
+        candidate_calls: List[ast.Call] = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 node_end = getattr(node, "end_lineno", node.lineno)
                 if node.lineno <= line_no <= node_end:
                     if patcher.call_filter(node):
-                        matching_call = node
-                        break
+                        candidate_calls.append(node)
 
-        if not matching_call:
+        # Disambiguate using finding's col_offset if available
+        finding_col_byte = None
+        if isinstance(f, Finding):
+            finding_col_byte = (f.extra or {}).get("col_offset")
+        elif isinstance(f, dict):
+            finding_col_byte = (f.get("extra") or {}).get("col_offset")
+            if finding_col_byte is None:
+                finding_col_byte = f.get("col_offset")
+
+        if finding_col_byte is not None and candidate_calls:
+            candidate_calls.sort(key=lambda c: abs(c.col_offset - finding_col_byte))
+
+        matching_call = None
+        patched_src = None
+        patch_reason = ""
+
+        # Try candidate calls; pick the first one that successfully transforms
+        for call in candidate_calls:
+            res_src, reason = patcher.patch_fn(current_content, call)
+            if res_src is not None and res_src != current_content:
+                matching_call = call
+                patched_src = res_src
+                patch_reason = ""
+                break
+            else:
+                patch_reason = reason
+
+        if not matching_call or patched_src is None:
             edits.append(
                 CodeEditRecord(
                     file=file_rel_path,
@@ -533,28 +693,14 @@ def patch_file_content(
                     test_id=test_id,
                     tier=patcher.tier,
                     status=PatchStatus.PATTERN_NOT_FOUND.value,
-                    reason=f"No matching call found for rule {test_id} on line {line_no}",
+                    reason=patch_reason or f"No matching call found for rule {test_id} on line {line_no}",
                 )
             )
             continue
 
-        patched_src, reason = patcher.patch_fn(current_content, matching_call)
-        if patched_src is None or patched_src == current_content:
-            edits.append(
-                CodeEditRecord(
-                    file=file_rel_path,
-                    line=line_no,
-                    test_id=test_id,
-                    tier=patcher.tier,
-                    status=PatchStatus.PATTERN_NOT_FOUND.value,
-                    reason=reason or "Pattern already safe or not matched",
-                )
-            )
-            continue
-
-        # Safety Net: Verify patched source compiles cleanly
+        # Safety Net 1: Verify patched source compiles cleanly
         try:
-            ast.parse(patched_src)
+            new_tree = ast.parse(patched_src)
         except SyntaxError as e:
             edits.append(
                 CodeEditRecord(
@@ -567,6 +713,27 @@ def patch_file_content(
                 )
             )
             continue
+
+        # Safety Net 2: Verify postcondition (e.g. timeout actually present in AST, not in comment)
+        if patcher.postcondition is not None:
+            passed_post = False
+            for node in ast.walk(new_tree):
+                if isinstance(node, ast.Call):
+                    if patcher.postcondition(node):
+                        passed_post = True
+                        break
+            if not passed_post:
+                edits.append(
+                    CodeEditRecord(
+                        file=file_rel_path,
+                        line=line_no,
+                        test_id=test_id,
+                        tier=patcher.tier,
+                        status=PatchStatus.PATTERN_NOT_FOUND.value,
+                        reason=f"Postcondition failed for rule {test_id}: fix was not properly reflected in AST",
+                    )
+                )
+                continue
 
         # Extract before/after line representation for reporting
         orig_lines = split_python_lines(current_content)
@@ -588,6 +755,8 @@ def patch_file_content(
             )
         )
 
+    # Sort edits in ascending line order for readable, deterministic reporting
+    edits.sort(key=lambda e: e.line)
     return current_content, edits
 
 

@@ -496,3 +496,111 @@ def test_code_patcher_default_dest_is_unique(tmp_path):
     assert r1.workspace.exists() and r2.workspace.exists()
 
 
+def test_code_patcher_non_ascii_byte_offset_on_same_line():
+    """Verify that UTF-8 multi-byte characters earlier on the same line do not shift AST spans."""
+    # 'données' contains two non-ASCII 'é' characters (each 2 bytes in UTF-8)
+    code = 'data = yaml.load(open("données.yml", "r"))\n'
+    new_content, edits = patch_file_content(code, [{"line": 1, "extra": {"test_id": "B506"}}])
+    assert len(edits) == 1
+    assert edits[0].applied is True
+    assert 'yaml.safe_load(open("données.yml", "r"))' in new_content
+
+
+def test_code_patcher_nested_and_chained_calls():
+    """Verify that chained calls (e.g. requests.get(...).json()) correctly select the target call."""
+    # B501 on requests.get(url, verify=False).json()
+    code_b501 = 'res = requests.get(url, verify=False).json()\n'
+    out_b501, edits_b501 = patch_file_content(code_b501, [{"line": 1, "extra": {"test_id": "B501"}}])
+    assert edits_b501[0].applied is True
+    assert 'requests.get(url, verify=True).json()' in out_b501
+
+    # B113 on requests.get(url).json()
+    code_b113 = 'res = requests.get(url).json()\n'
+    out_b113, edits_b113 = patch_file_content(code_b113, [{"line": 1, "extra": {"test_id": "B113"}}])
+    assert edits_b113[0].applied is True
+    assert 'requests.get(url, timeout=10).json()' in out_b113
+
+
+def test_code_patcher_multiple_calls_on_same_line_disambiguation():
+    """Verify that multiple calls on the same line are disambiguated by col_offset and filter."""
+    code = 'a = requests.get(x, timeout=1); b = requests.get(y)\n'
+    # Finding points to the second call at col_offset=36
+    finding = {"line": 1, "extra": {"test_id": "B113", "col_offset": 36}}
+    out, edits = patch_file_content(code, [finding])
+    assert edits[0].applied is True
+    assert 'a = requests.get(x, timeout=1)' in out
+    assert 'b = requests.get(y, timeout=10)' in out
+
+
+def test_code_patcher_multiline_collapse_preserves_subsequent_findings():
+    """Verify that a multi-line collapse at an earlier line does not desynchronize subsequent findings."""
+    code = (
+        "import yaml\n"
+        "res1 = yaml.load(\n"
+        "    stream1,\n"
+        "    Loader=yaml.Loader,\n"
+        ")\n"
+        "x = 1\n"
+        "y = 2\n"
+        "z = 3\n"
+        "res2 = yaml.load(stream2, Loader=yaml.Loader)\n"
+    )
+    findings = [
+        {"line": 2, "extra": {"test_id": "B506"}},
+        {"line": 9, "extra": {"test_id": "B506"}},
+    ]
+    new_content, edits = patch_file_content(code, findings)
+    assert len(edits) == 2
+    assert edits[0].applied is True and edits[1].applied is True
+    assert "res1 = yaml.safe_load(stream1)" in new_content
+    assert "res2 = yaml.safe_load(stream2)" in new_content
+
+
+def test_code_patcher_call_with_comment_before_closing_paren():
+    """Verify that arguments are inserted before comments and not swallowed inside them."""
+    code = "requests.get(url  # comment with, comma\n)\n"
+    new_content, edits = patch_file_content(code, [{"line": 1, "extra": {"test_id": "B113"}}])
+    assert edits[0].applied is True
+    assert "timeout=10" in new_content
+    assert "# comment with, comma" in new_content
+    # Parse to ensure timeout=10 is an actual argument, not in the comment
+    import ast
+    tree = ast.parse(new_content)
+    call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call))
+    assert any(kw.arg == "timeout" for kw in call.keywords)
+
+
+def test_code_patcher_no_trailing_newline_git_apply_check(tmp_path):
+    """Verify that diffs for files lacking trailing newlines apply cleanly with git apply."""
+    import shutil
+    import subprocess
+    if not shutil.which("git"):
+        pytest.skip("git not installed on system")
+
+    repo_dir = tmp_path / "git_repo"
+    repo_dir.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+    subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=repo_dir, capture_output=True, check=True)
+
+    test_file = repo_dir / "target.py"
+    # Write file without trailing newline
+    test_file.write_bytes(b"import flask\napp.run(debug=True)")
+    subprocess.run(["git", "add", "target.py"], cwd=repo_dir, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, capture_output=True, check=True)
+
+    orig_content = "import flask\napp.run(debug=True)"
+    _, diff, edits = generate_file_patch("target.py", orig_content, [{"line": 2, "extra": {"test_id": "B201"}}])
+    assert edits[0].applied is True
+    assert "\\ No newline at end of file" in diff
+
+    # Test git apply --check on the generated diff
+    proc = subprocess.run(
+        ["git", "apply", "--check", "-"],
+        input=diff.encode("utf-8"),
+        cwd=repo_dir,
+        capture_output=True,
+    )
+    assert proc.returncode == 0, f"git apply failed: {proc.stderr.decode('utf-8', errors='replace')}"
+
+
+

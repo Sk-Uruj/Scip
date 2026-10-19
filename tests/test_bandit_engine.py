@@ -282,6 +282,19 @@ def test_bandit_include_suppressed_passes_flag(tmp_path):
         assert "--ignore-nosec" in cmd
 
 
+def test_bandit_exclude_paths_passes_x_flag(tmp_path):
+    (tmp_path / "main.py").write_text("print('test')", encoding="utf-8")
+    engine = BanditEngine(exclude_paths=["tests", "fixtures"])
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "errors": []}', stderr="")
+        engine.scan(str(tmp_path))
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "-x" in cmd
+        assert "tests,fixtures" in cmd
+
+
+
 def test_rel_path_relative_to_root_when_cwd_is_subdirectory(tmp_path, monkeypatch):
     repo_dir = tmp_path / "repo"
     sub_dir = repo_dir / "sub"

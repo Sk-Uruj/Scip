@@ -6,6 +6,7 @@ and dangerous built-ins.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import logging
 import os
@@ -13,8 +14,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tokenize
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from core.finding import Finding
 from core.redact import redact_finding
@@ -378,6 +380,205 @@ def _calculate_exploitability(
     conf_mult = {"HIGH": 1.0, "MEDIUM": 0.8, "LOW": 0.5}.get((issue_conf or "").upper(), 0.7)
     return round(max(0.05, min(1.0, base * conf_mult)), 2)
 
+TEST_DIR_NAMES: Set[str] = {
+    "test",
+    "tests",
+    "testing",
+    "__tests__",
+    "spec",
+    "specs",
+    "fixtures",
+    "fixture",
+    "mocks",
+    "mock",
+    "stubs",
+    "stub",
+}
+
+DOC_SAMPLE_DIR_NAMES: Set[str] = {
+    "docs",
+    "doc",
+    "documentation",
+    "examples",
+    "example",
+    "samples",
+    "sample",
+    "demo",
+    "demos",
+    "tutorial",
+    "tutorials",
+}
+
+
+def classify_file_role(path_str: str) -> Dict[str, Any]:
+    """Classify a file path into its repository role (test, sample, docs, production).
+
+    Returns a dict with:
+        file_role: 'test' | 'sample' | 'docs' | 'production'
+        is_test_code: bool
+        is_sample_code: bool
+    """
+    norm = path_str.replace("\\", "/").lower()
+    parts = norm.split("/")
+    dir_parts = set(parts[:-1])
+    filename = parts[-1]
+
+    # Check test / mock / fixture paths
+    is_test_dir = bool(dir_parts & TEST_DIR_NAMES)
+    is_test_file = (
+        filename.startswith("test_")
+        or filename.endswith("_test.py")
+        or filename.endswith("_test")
+        or filename == "conftest.py"
+        or filename.startswith("mock_")
+        or filename.endswith("_mock.py")
+    )
+
+    if is_test_dir or is_test_file:
+        return {
+            "file_role": "test",
+            "is_test_code": True,
+            "is_sample_code": False,
+        }
+
+    # Check docs / sample / example paths
+    is_doc_dir = bool(dir_parts & {"docs", "doc", "documentation"})
+    is_sample_dir = bool(dir_parts & {"examples", "example", "samples", "sample", "demo", "demos", "tutorial", "tutorials"})
+    is_sample_file = (
+        filename.startswith("example_")
+        or filename.startswith("sample_")
+        or filename.startswith("demo_")
+    )
+
+    if is_doc_dir:
+        return {
+            "file_role": "docs",
+            "is_test_code": False,
+            "is_sample_code": True,
+        }
+
+    if is_sample_dir or is_sample_file:
+        return {
+            "file_role": "sample",
+            "is_test_code": False,
+            "is_sample_code": True,
+        }
+
+    return {
+        "file_role": "production",
+        "is_test_code": False,
+        "is_sample_code": False,
+    }
+
+
+class _EnclosingScopeVisitor(ast.NodeVisitor):
+    """AST visitor that finds the innermost enclosing function, class, and qualified scope for a line."""
+
+    def __init__(self, target_line: int):
+        self.target_line = target_line
+        self.enclosing_class: Optional[str] = None
+        self.enclosing_function: Optional[str] = None
+        self.enclosing_scope: Optional[str] = None
+        self._class_stack: List[str] = []
+        self._func_stack: List[str] = []
+        self._smallest_func_span: float = float("inf")
+        self._smallest_class_span: float = float("inf")
+
+    def visit_ClassDef(self, node: ast.ClassDef):
+        start = node.lineno
+        end = getattr(node, "end_lineno", node.lineno)
+        self._class_stack.append(node.name)
+        if start <= self.target_line <= end:
+            span = end - start
+            if span < self._smallest_class_span:
+                self._smallest_class_span = span
+                self.enclosing_class = node.name
+                if not self.enclosing_scope:
+                    self.enclosing_scope = ".".join(self._class_stack)
+        self.generic_visit(node)
+        self._class_stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        self._process_func(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
+        self._process_func(node)
+
+    def _process_func(self, node: ast.FunctionDef | ast.AsyncFunctionDef):
+        start = node.lineno
+        end = getattr(node, "end_lineno", node.lineno)
+        self._func_stack.append(node.name)
+        if start <= self.target_line <= end:
+            span = end - start
+            if span < self._smallest_func_span:
+                self._smallest_func_span = span
+                self.enclosing_function = node.name
+                scope_parts = list(self._class_stack) + list(self._func_stack)
+                self.enclosing_scope = ".".join(scope_parts)
+        self.generic_visit(node)
+        self._func_stack.pop()
+
+
+def extract_enclosing_scope_from_source(
+    source_code: str,
+    line_number: Optional[int],
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract (enclosing_function, enclosing_class, enclosing_scope) from source code."""
+    if not line_number or line_number <= 0 or not source_code:
+        return None, None, None
+    try:
+        tree = ast.parse(source_code)
+        visitor = _EnclosingScopeVisitor(line_number)
+        visitor.visit(tree)
+        return visitor.enclosing_function, visitor.enclosing_class, visitor.enclosing_scope
+    except Exception:
+        return None, None, None
+
+
+def extract_enclosing_scope(
+    file_path: Path | str,
+    line_number: Optional[int],
+    ast_cache: Optional[Dict[str, Optional[ast.AST]]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Extract (enclosing_function, enclosing_class, enclosing_scope) for a given file and line number.
+
+    Returns (None, None, None) if file cannot be read/parsed or line is outside any scope.
+    """
+    if not line_number or line_number <= 0:
+        return None, None, None
+
+    path_obj = Path(file_path)
+    path_key = str(path_obj.resolve()) if path_obj.exists() else str(file_path)
+
+    tree: Optional[ast.AST] = None
+    if ast_cache is not None and path_key in ast_cache:
+        tree = ast_cache[path_key]
+    else:
+        if path_obj.exists() and path_obj.is_file():
+            try:
+                try:
+                    with tokenize.open(path_obj) as f:
+                        source = f.read()
+                except Exception:
+                    with open(path_obj, "r", encoding="utf-8", errors="ignore") as f:
+                        source = f.read()
+                tree = ast.parse(source, filename=str(path_obj))
+            except Exception:
+                tree = None
+        if ast_cache is not None:
+            ast_cache[path_key] = tree
+
+    if tree is None:
+        return None, None, None
+
+    visitor = _EnclosingScopeVisitor(line_number)
+    try:
+        visitor.visit(tree)
+    except Exception:
+        return None, None, None
+
+    return visitor.enclosing_function, visitor.enclosing_class, visitor.enclosing_scope
+
 
 class BanditEngine(Engine):
     name = "bandit"
@@ -391,6 +592,7 @@ class BanditEngine(Engine):
         confidence_min: Optional[str] = None,
         timeout: int = TIMEOUT,
         include_suppressed: bool = False,
+        exclude_paths: Optional[List[str]] = None,
     ):
         if config_file:
             self.config_file = str(Path(config_file).resolve())
@@ -404,6 +606,7 @@ class BanditEngine(Engine):
         self.confidence_min = confidence_min
         self.timeout = timeout
         self.include_suppressed = include_suppressed
+        self.exclude_paths = exclude_paths
         self.stats: Dict[str, Any] = {}
 
     def is_available(self) -> bool:
@@ -472,6 +675,8 @@ class BanditEngine(Engine):
                 cmd.append(flag)
         if self.include_suppressed:
             cmd.append("--ignore-nosec")
+        if self.exclude_paths:
+            cmd.extend(["-x", ",".join(self.exclude_paths)])
 
         # Pass target path with '--' to prevent flag injection.
         # Run with cwd=root and relative target '.' to prevent parent directories (e.g. /env/)
@@ -532,15 +737,21 @@ class BanditEngine(Engine):
 
         results = data.get("results", [])
         findings: List[Finding] = []
+        ast_cache: Dict[str, Optional[ast.AST]] = {}
 
         for r in results:
-            findings.append(self._make_finding(r, root))
+            findings.append(self._make_finding(r, root, ast_cache=ast_cache))
 
         findings.sort(key=lambda f: (-f.severity, -f.exploitability, f.file, f.line or 0))
         self.stats["findings_count"] = len(findings)
         return findings
 
-    def _make_finding(self, r: Dict[str, Any], root: Path) -> Finding:
+    def _make_finding(
+        self,
+        r: Dict[str, Any],
+        root: Path,
+        ast_cache: Optional[Dict[str, Optional[ast.AST]]] = None,
+    ) -> Finding:
         test_id = r.get("test_id", "UNKNOWN")
         test_name = r.get("test_name", "")
         raw_text = (r.get("issue_text") or "").strip()
@@ -565,6 +776,45 @@ class BanditEngine(Engine):
         # Exploitability heuristic based on rule calibration and confidence
         exploitability = _calculate_exploitability(issue_sev, issue_conf, test_id=test_id)
 
+        # Context classification & damping (Phase 5)
+        file_context = classify_file_role(normalized_file)
+        is_test = file_context["is_test_code"]
+        is_sample = file_context["is_sample_code"]
+        file_role = file_context["file_role"]
+
+        fp_likelihood: Optional[str] = None
+        fp_reason: Optional[str] = None
+        exposure: Optional[str] = None
+
+        if is_test:
+            exploitability = max(0.01, round(exploitability * 0.3, 3))
+            fp_likelihood = "MEDIUM"
+            fp_reason = "Test or test fixture code context"
+            exposure = "TEST"
+        elif is_sample:
+            exploitability = max(0.01, round(exploitability * 0.5, 3))
+            fp_likelihood = "MEDIUM"
+            fp_reason = "Sample or documentation code context"
+
+        # AST enclosing scope extraction (Phase 5)
+        full_path: Optional[Path] = None
+        if raw_filename:
+            raw_p = Path(raw_filename)
+            if raw_p.is_absolute() and raw_p.exists():
+                full_path = raw_p
+            else:
+                candidate = root / normalized_file
+                if candidate.exists():
+                    full_path = candidate
+                elif (root / raw_filename).exists():
+                    full_path = root / raw_filename
+
+        enc_func: Optional[str] = None
+        enc_class: Optional[str] = None
+        enc_scope: Optional[str] = None
+        if full_path is not None and line:
+            enc_func, enc_class, enc_scope = extract_enclosing_scope(full_path, line, ast_cache=ast_cache)
+
         # Fix hint
         fix_hint = COMMON_FIX_HINTS.get(
             test_id,
@@ -584,7 +834,19 @@ class BanditEngine(Engine):
             "col_offset": r.get("col_offset"),
             "end_col_offset": r.get("end_col_offset"),
             "more_info": r.get("more_info", ""),
+            "file_role": file_role,
+            "is_test_code": is_test,
+            "is_sample_code": is_sample,
+            "enclosing_function": enc_func,
+            "enclosing_class": enc_class,
+            "enclosing_scope": enc_scope,
         }
+        if fp_likelihood is not None:
+            extra_dict["fp_likelihood"] = fp_likelihood
+            extra_dict["false_positive_risk"] = fp_likelihood
+            extra_dict["fp_reason"] = fp_reason
+        if exposure is not None:
+            extra_dict["exposure"] = exposure
         if remediation_meta is not None:
             extra_dict["remediation"] = remediation_meta
 
@@ -599,5 +861,8 @@ class BanditEngine(Engine):
             evidence=code_snippet,
             fix_hint=fix_hint,
             exploitability=exploitability,
+            exposure=exposure,
+            fp_likelihood=fp_likelihood,
+            fp_reason=fp_reason,
             extra=extra_dict,
         ))

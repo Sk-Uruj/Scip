@@ -45,7 +45,7 @@ def make_workspace(repo: Path, dest: Path) -> Path:
         raise ValueError("workspace must be outside the repository")
     if dest.exists():
         shutil.rmtree(dest)
-    shutil.copytree(repo, dest, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
+    shutil.copytree(repo, dest, symlinks=True, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
     return dest
 
 
