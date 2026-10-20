@@ -65,6 +65,78 @@ def get_engines(
     return active
 
 
+def resolve_changed_files(
+    diff_base: Optional[str] = None,
+    changed_files: Optional[str] = None,
+    repo_path: str = ".",
+) -> Optional[Set[str]]:
+    """Determine the set of relative changed files, or None if no filter is active."""
+    if not diff_base and not changed_files:
+        return None
+
+    result: Set[str] = set()
+    if changed_files:
+        p = Path(changed_files)
+        if p.exists() and p.is_file():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip().replace("\\", "/").lstrip("./")
+                        if line:
+                            result.add(line)
+            except Exception as e:
+                logging.getLogger("pipeline").warning(f"Failed to read changed-files file {changed_files}: {e}")
+        else:
+            import re
+            for item in re.split(r"[,\s]+", changed_files.strip()):
+                item = item.strip().replace("\\", "/").lstrip("./")
+                if item:
+                    result.add(item)
+
+    if diff_base:
+        try:
+            import subprocess
+            cmd = ["git", "diff", "--name-only", f"{diff_base}...HEAD"]
+            res = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    line = line.strip().replace("\\", "/").lstrip("./")
+                    if line:
+                        result.add(line)
+            else:
+                cmd2 = ["git", "diff", "--name-only", diff_base, "HEAD"]
+                res2 = subprocess.run(cmd2, cwd=repo_path, capture_output=True, text=True)
+                if res2.returncode == 0:
+                    for line in res2.stdout.splitlines():
+                        line = line.strip().replace("\\", "/").lstrip("./")
+                        if line:
+                            result.add(line)
+        except Exception as e:
+            logging.getLogger("pipeline").warning(f"Failed to resolve changed files from git diff {diff_base}: {e}")
+
+    return result
+
+
+def is_file_in_changed_set(file_path: str, changed_files: Set[str], repo_path: Optional[str] = None) -> bool:
+    """Check if finding file matches any file in the changed files set."""
+    if not file_path:
+        return False
+    clean = file_path.replace("\\", "/")
+    if repo_path:
+        clean_repo = repo_path.replace("\\", "/").rstrip("/")
+        if clean.startswith(clean_repo + "/"):
+            clean = clean[len(clean_repo) + 1 :]
+    while clean.startswith("./") or clean.startswith("/"):
+        clean = clean.lstrip("./").lstrip("/")
+
+    if clean in changed_files:
+        return True
+    for cf in changed_files:
+        if clean == cf or clean.endswith("/" + cf) or cf.endswith("/" + clean):
+            return True
+    return False
+
+
 def run_scan(
     repo_path: str,
     engines: Optional[list] = None,
@@ -78,6 +150,7 @@ def run_scan(
     training_paths: Optional[List[str]] = None,
     hide_fp: bool = False,
     hidden_fp_out: Optional[List[Finding]] = None,
+    changed_files: Optional[Set[str]] = None,
 ) -> List[Finding]:
     engines = engines if engines is not None else get_engines(include_suppressed=include_suppressed)
     findings: List[Finding] = []
@@ -156,6 +229,14 @@ def run_scan(
                   file=sys.stderr)
             for reason, n in Counter((f.fp_reason or "unspecified")[:90] for f in hidden).most_common(5):
                 print(f"      {n:>3} x {reason}", file=sys.stderr)
+
+    # 6. Optional: filter to changed files only (e.g. for PR diff scans)
+    if changed_files is not None and active:
+        pre_count = len(active)
+        active = [f for f in active if is_file_in_changed_set(f.file, changed_files, repo_path=repo_path)]
+        filtered = pre_count - len(active)
+        print(f"[+] PR scope: limited report to {len(active)} finding(s) across {len(changed_files)} changed file(s) "
+              f"({filtered} pre-existing finding(s) in unmodified files excluded)", file=sys.stderr)
 
     # Safety net: no engine may ever put a credential value into the report (idempotent).
     for f in active:
@@ -295,6 +376,14 @@ def main(argv=None) -> int:
     ap.add_argument("--output", "-o", metavar="FILE",
                     help="write full JSON to FILE (UTF-8). Use this instead of '>' in PowerShell, "
                          "which saves UTF-16 that many tools cannot read")
+    ap.add_argument("--sarif-out", "--sarif", metavar="FILE",
+                    help="export findings to SARIF 2.1.0 format (for GitHub Code Scanning)")
+    ap.add_argument("--summary", action="store_true",
+                    help="generate markdown summary table (written to $GITHUB_STEP_SUMMARY if in CI, else printed)")
+    ap.add_argument("--diff-base", metavar="REF",
+                    help="scope findings to files changed relative to git REF (e.g. origin/main or HEAD~1)")
+    ap.add_argument("--changed-files", metavar="FILES_OR_FILE",
+                    help="scope findings to a comma-separated list of files or path to a file containing changed files")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -350,6 +439,11 @@ def main(argv=None) -> int:
         return 0
 
     hidden_fp: List[Finding] = []
+    changed_files = resolve_changed_files(
+        diff_base=args.diff_base,
+        changed_files=args.changed_files,
+        repo_path=args.path,
+    )
     try:
         findings = run_scan(
             args.path,
@@ -364,6 +458,7 @@ def main(argv=None) -> int:
             training_paths=args.training_path,
             hide_fp=args.hide_fp,
             hidden_fp_out=hidden_fp,
+            changed_files=changed_files,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -388,6 +483,25 @@ def main(argv=None) -> int:
             with open(sidecar, "w", encoding="utf-8", newline="\n") as fh:
                 json.dump([f.to_dict() for f in hidden_fp], fh, indent=2)
             print(f"[+] Wrote the {len(hidden_fp)} hidden false positive(s) to {sidecar}", file=sys.stderr)
+
+    if args.sarif_out:
+        from core.sarif import export_sarif
+        export_sarif(findings, args.sarif_out, repo_path=args.path)
+        print(f"[+] Wrote {len(findings)} findings in SARIF v2.1.0 to {args.sarif_out}", file=sys.stderr)
+
+    step_summary_env = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary_env or args.summary:
+        from core.sarif import generate_markdown_summary
+        summary_md = generate_markdown_summary(findings)
+        if step_summary_env:
+            try:
+                with open(step_summary_env, "a", encoding="utf-8") as sf:
+                    sf.write(summary_md + "\n\n")
+                print("[+] Wrote scan summary to $GITHUB_STEP_SUMMARY", file=sys.stderr)
+            except Exception as e:
+                logging.getLogger("pipeline").warning(f"Could not write to GITHUB_STEP_SUMMARY: {e}")
+        elif args.summary:
+            print("\n" + summary_md)
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
         for e in engines:

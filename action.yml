@@ -1,0 +1,97 @@
+name: 'SCIP Security Review'
+description: 'Prioritized security scanner and CodeRabbit-style automated PR reviewer'
+author: 'Roshan Kumar Singh'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  github-token:
+    description: 'GitHub token for posting review comments and one-click code suggestions'
+    required: false
+    default: ${{ github.token }}
+  diff-only:
+    description: 'Scope findings to changed files on pull requests (default true)'
+    required: false
+    default: 'true'
+  enable-sarif:
+    description: 'Upload findings to GitHub Code Scanning tab'
+    required: false
+    default: 'true'
+  enable-pr-comment:
+    description: 'Post/update sticky executive summary comment on pull requests'
+    required: false
+    default: 'true'
+  enable-suggestions:
+    description: 'Post inline review comments with one-click code suggestions'
+    required: false
+    default: 'true'
+  exclude-tests:
+    description: 'Exclude test files and mock fixtures from scan'
+    required: false
+    default: 'true'
+  fail-on:
+    description: 'Fail check if active findings meet or exceed severity (CRITICAL, HIGH, MEDIUM, LOW, or NONE)'
+    required: false
+    default: 'NONE'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install SCIP dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r ${{ github.action_path }}/requirements.txt
+
+    - name: Run SCIP Security Scan
+      shell: bash
+      run: |
+        EXTRA_ARGS=""
+        if [ "${{ inputs.exclude-tests }}" = "true" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --exclude-tests"
+        fi
+        if [ "${{ inputs.fail-on }}" != "NONE" ]; then
+          EXTRA_ARGS="$EXTRA_ARGS --fail-on ${{ inputs.fail-on }}"
+        fi
+
+        if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ inputs.diff-only }}" = "true" ]; then
+          echo "::notice::Running scoped PR scan on files changed against origin/${{ github.base_ref }}"
+          git fetch origin ${{ github.base_ref }} --depth=1 || true
+          PYTHONPATH="${{ github.action_path }}:$PYTHONPATH" python -m core.pipeline . \
+            --sarif-out scip-results.sarif \
+            --output scip-results.json \
+            --diff-base "origin/${{ github.base_ref }}" \
+            $EXTRA_ARGS
+        else
+          echo "::notice::Running full repository scan"
+          PYTHONPATH="${{ github.action_path }}:$PYTHONPATH" python -m core.pipeline . \
+            --sarif-out scip-results.sarif \
+            --output scip-results.json \
+            $EXTRA_ARGS
+        fi
+
+    - name: Upload SARIF to GitHub Code Scanning
+      if: inputs.enable-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v3
+      continue-on-error: true
+      with:
+        sarif_file: scip-results.sarif
+        category: scip-security-scanner
+
+    - name: Post CodeRabbit-style PR Review
+      if: github.event_name == 'pull_request' && (inputs.enable-pr-comment == 'true' || inputs.enable-suggestions == 'true')
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        SCIP_RESULTS_PATH: scip-results.json
+        ENABLE_PR_COMMENT: ${{ inputs.enable-pr-comment }}
+        ENABLE_SUGGESTIONS: ${{ inputs.enable-suggestions }}
+      run: |
+        PYTHONPATH="${{ github.action_path }}:$PYTHONPATH" python ${{ github.action_path }}/scripts/github_pr_bot.py

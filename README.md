@@ -61,10 +61,57 @@ Save a full report as UTF-8 JSON with `-o report.json` (do not use `>` in PowerS
 | `--engines dependency,secrets` / `--no-bandit` ... | choose engines |
 | `--details` | print attack paths and remediation hints |
 | `-o FILE`, `--json` | UTF-8 JSON report (includes the score `explanation`) |
+| `--sarif-out FILE` | export findings in SARIF v2.1.0 format for GitHub Code Scanning / CI |
+| `--summary` | output formatted markdown summary table (auto-written to `$GITHUB_STEP_SUMMARY` in CI) |
 | `--hide-fp` | hide HIGH-likelihood false positives. Opt-in; prints what was hidden and saves it to `<output>.hidden-fp.json` |
 | `--training-path PATH` | declare a folder as training/example code (strongly demoted). Never inferred from the repo |
 | `--baseline FILE`, `--make-baseline FILE` | accept known findings |
 | `--ci`, `--fail-on HIGH`, `--strict` | CI gating |
+
+## CI/CD & GitHub Code Scanning
+
+SCIP includes native SARIF v2.1.0 output and is packaged as a **reusable GitHub Action** (`action.yml`) that any repository can use.
+
+When integrated into pull requests, SCIP acts like an automated security reviewer (CodeRabbit style):
+* **Sticky Executive Summary**: Updates in-place with risk score badges, findings breakdown, and native Mermaid attack path graphs.
+* **1-Click Code Suggestions**: Formats remediation patches into GitHub's native ````suggestion```` diff blocks so reviewers/authors can commit fixes with one click.
+* **PR-Scoped Scanning**: Focuses only on files touched in the PR, filtering out legacy noise in unmodified files.
+* **GitHub Security Tab**: Results are uploaded as SARIF v2.1.0 to **Security > Code Scanning** with CWE badges and CVSS ratings.
+* **100% Serverless & Private**: Runs entirely within your own GitHub Actions runners; code never leaves GitHub.
+
+### Quick Start in Any Repository
+
+Create `.github/workflows/scip.yml` in your repository:
+
+```yaml
+name: SCIP Security Review
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write   # to post sticky summary and 1-click code suggestions
+  security-events: write # to upload SARIF to GitHub Code Scanning
+
+jobs:
+  security-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SCIP Security Review
+        uses: roshankumar0036singh/Scip@main
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          diff-only: 'true'
+          enable-suggestions: 'true'
+```
 
 ## Trust model: the scanned repository is untrusted input
 
