@@ -1,37 +1,96 @@
 {
     "django": {
-        "GeoDjango": ["django.contrib.gis"],
-        "strip_tags": ["django.utils.html.strip_tags", "striptags"],
-        "urlize": ["django.utils.html.urlize", "urlize", "urlizetrunc"],
-        "intcomma": ["django.contrib.humanize"],
-        "Truncator": ["django.utils.text.Truncator", "truncatechars", "truncatewords"],
-        "archive": ["django.utils.archive"],
-        "cache middleware": ["django.middleware.cache"],
-        "column aliases": ["annotate", "alias", "FilteredRelation"]
+        "GeoDjango": [
+            "django.contrib.gis"
+        ],
+        "strip_tags": [
+            "django.utils.html.strip_tags",
+            "striptags"
+        ],
+        "urlize": [
+            "django.utils.html.urlize",
+            "urlize",
+            "urlizetrunc"
+        ],
+        "intcomma": [
+            "django.contrib.humanize"
+        ],
+        "Truncator": [
+            "django.utils.text.Truncator",
+            "truncatechars",
+            "truncatewords"
+        ],
+        "archive": [
+            "django.utils.archive"
+        ],
+        "cache middleware": [
+            "django.middleware.cache"
+        ],
+        "column aliases": [
+            "annotate",
+            "alias",
+            "FilteredRelation"
+        ]
     },
     "pillow": {
-        "ImageDraw": ["PIL.ImageDraw", "ImageDraw"],
-        "ImageFont": ["PIL.ImageFont", "ImageFont"]
+        "ImageDraw": [
+            "PIL.ImageDraw",
+            "ImageDraw"
+        ],
+        "ImageFont": [
+            "PIL.ImageFont",
+            "ImageFont"
+        ]
     },
     "pyjwt": {
-        "PyJWKClient": ["jwt.PyJWKClient", "PyJWKClient"],
-        "JWK": ["jwt.algorithms.OKP", "jwt.jwks", "JWK"],
-        "is_pem_format": ["pem", "cryptography.hazmat"]
+        "PyJWKClient": [
+            "jwt.PyJWKClient",
+            "PyJWKClient"
+        ],
+        "JWK": [
+            "jwt.algorithms.OKP",
+            "jwt.jwks",
+            "JWK"
+        ],
+        "is_pem_format": [
+            "pem",
+            "cryptography.hazmat"
+        ]
     },
     "werkzeug": {
-        "safe_join": ["werkzeug.security.safe_join", "werkzeug.utils.safe_join", "safe_join"]
+        "safe_join": [
+            "werkzeug.security.safe_join",
+            "werkzeug.utils.safe_join",
+            "safe_join"
+        ]
     },
     "requests": {
-        "extract_zipped_paths": ["requests.certs.extract_zipped_paths"]
+        "extract_zipped_paths": [
+            "requests.certs.extract_zipped_paths"
+        ]
     },
     "urllib3": {
-        "Proxy": ["urllib3.ProxyManager", "urllib3.poolmanager.ProxyManager", "https proxy", "proxy-authorization"]
+        "Proxy": [
+            "urllib3.ProxyManager",
+            "urllib3.poolmanager.ProxyManager",
+            "https proxy",
+            "proxy-authorization"
+        ]
     },
     "sqlparse": {
-        "regular expression": ["sqlparse.format", "sqlparse.split", "sqlparse.parse"],
-        "formatting": ["sqlparse.format", "sqlparse.split"]
+        "regular expression": [
+            "sqlparse.format",
+            "sqlparse.split",
+            "sqlparse.parse"
+        ],
+        "formatting": [
+            "sqlparse.format",
+            "sqlparse.split"
+        ]
     },
     "flask": {
-        "session": ["flask.session"]
+        "session": [
+            "flask.session"
+        ]
     }
 }
