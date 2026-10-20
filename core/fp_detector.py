@@ -624,6 +624,116 @@ def _detect_single_finding_fp(
                 f.title = f"[REF-ID] {f.title}"
             f.fix_hint = "For transaction reference IDs, standard PRNG may be acceptable, but use secrets.choice or uuid4 to prevent reference enumeration/prediction."
 
+    # 6. Dependency Engine Contextual & Platform Guards
+    if f.engine == "dependency":
+        combined_dep_text = f"{title} {desc} {evidence}".lower()
+        env_ctx = _get_repo_env_context(repo_path)
+
+        # A. Windows-specific vulnerabilities on Linux deployments
+        windows_keywords = (
+            "windows special device names", "on windows", "dos only on windows",
+            "safe_join not safe on windows", "windows device name", "windows special device",
+            "safe_join() allows windows",
+        )
+        if env_ctx.get("is_linux") and any(w in combined_dep_text for w in windows_keywords):
+            f.fp_likelihood = "HIGH"
+            f.fp_reason = "Vulnerability only affects Windows environments (Linux deployment detected)"
+            f.extra["fp_likelihood"] = f.fp_likelihood
+            f.extra["fp_reason"] = f.fp_reason
+            return
+
+        # B. ASGI request smuggling on WSGI deployments
+        if env_ctx.get("is_wsgi_only") and (
+            "sgi requests with a missing or understated" in combined_dep_text
+            or ("asgi" in combined_dep_text and "request" in combined_dep_text)
+        ):
+            f.fp_likelihood = "HIGH"
+            f.fp_reason = "Vulnerability only affects ASGI request handling (project runs on WSGI)"
+            f.extra["fp_likelihood"] = f.fp_likelihood
+            f.extra["fp_reason"] = f.fp_reason
+            return
+
+        # C. Zip archive execution requirement
+        if "extract_zipped_paths" in combined_dep_text:
+            f.fp_likelihood = "HIGH"
+            f.fp_reason = "Vulnerability only applies when package runs from a zip archive (extract_zipped_paths)"
+            f.extra["fp_likelihood"] = f.fp_likelihood
+            f.extra["fp_reason"] = f.fp_reason
+            return
+
+        # D. Proxy authorization / proxy TLS configuration without proxy configured
+        if not env_ctx.get("has_proxy") and any(p in combined_dep_text for p in ("proxy-authorization", "https proxy tls")):
+            f.fp_likelihood = "HIGH"
+            f.fp_reason = "Vulnerability requires proxy configuration, but no proxy is configured"
+            f.extra["fp_likelihood"] = f.fp_likelihood
+            f.extra["fp_reason"] = f.fp_reason
+            return
+
+
+_REPO_ENV_CACHE: Dict[str, dict] = {}
+
+
+def _get_repo_env_context(repo_path: Optional[str]) -> dict:
+    if not repo_path or not os.path.isdir(repo_path):
+        return {"is_linux": False, "is_wsgi_only": False, "has_proxy": False}
+    abs_root = os.path.abspath(repo_path)
+    if abs_root in _REPO_ENV_CACHE:
+        return _REPO_ENV_CACHE[abs_root]
+
+    is_linux = False
+    is_wsgi_only = False
+    has_proxy = False
+
+    # 1. Check Dockerfile
+    dockerfile_path = os.path.join(abs_root, "Dockerfile")
+    if os.path.isfile(dockerfile_path):
+        try:
+            with open(dockerfile_path, "r", encoding="utf-8", errors="ignore") as fh:
+                d_text = fh.read().lower()
+                if any(k in d_text for k in ("python:", "debian", "ubuntu", "alpine", "buster", "slim", "apt-get", "apk add", "yum install")):
+                    is_linux = True
+                if "gunicorn" in d_text and "wsgi" in d_text and "uvicorn" not in d_text:
+                    is_wsgi_only = True
+        except Exception:
+            pass
+
+    # 2. Check Procfile
+    procfile_path = os.path.join(abs_root, "Procfile")
+    if os.path.isfile(procfile_path):
+        try:
+            with open(procfile_path, "r", encoding="utf-8", errors="ignore") as fh:
+                p_text = fh.read().lower()
+                if "gunicorn" in p_text and "wsgi" in p_text and "uvicorn" not in p_text:
+                    is_wsgi_only = True
+                if "gunicorn" in p_text or "uwsgi" in p_text:
+                    is_linux = True
+        except Exception:
+            pass
+
+    # 3. Check docker-compose.yml
+    dc_path = os.path.join(abs_root, "docker-compose.yml")
+    if os.path.isfile(dc_path):
+        is_linux = True
+
+    # 4. Check for proxy configuration in settings or env files
+    for fn in ("settings.py", ".env", "config.py", "local_settings.py"):
+        for root_dir, _, files in os.walk(abs_root):
+            if fn in files:
+                try:
+                    with open(os.path.join(root_dir, fn), "r", encoding="utf-8", errors="ignore") as fh:
+                        content = fh.read().lower()
+                        if "http_proxy" in content or "https_proxy" in content or "proxymanager" in content:
+                            has_proxy = True
+                            break
+                except Exception:
+                    pass
+            if has_proxy:
+                break
+
+    res = {"is_linux": is_linux, "is_wsgi_only": is_wsgi_only, "has_proxy": has_proxy}
+    _REPO_ENV_CACHE[abs_root] = res
+    return res
+
 
 def _protected_reason(f: Finding) -> Optional[str]:
     """Findings that must never be labelled a false positive, whichever rule fired."""

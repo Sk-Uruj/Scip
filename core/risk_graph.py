@@ -368,6 +368,24 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 for t in node.targets:
                     if isinstance(t, ast.Name):
                         self.var_types[t.id] = type_name
+
+        # Detect Django INSTALLED_APPS and MIDDLEWARE string entries
+        for target in getattr(node, "targets", []):
+            target_name = getattr(target, "id", "")
+            if target_name in ("INSTALLED_APPS", "MIDDLEWARE", "MIDDLEWARE_CLASSES"):
+                if isinstance(node.value, (ast.List, ast.Tuple, ast.Set)):
+                    for elt in node.value.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            app_pkg = elt.value.lower().strip()
+                            pkg_id = f"pkg::{app_pkg}"
+                            self.graph.add_node(pkg_id, kind="PACKAGE", label=elt.value, is_test=self.is_test)
+                            self.graph.add_edge(self.module_node_id, pkg_id, kind="IMPORTS")
+                            top_pkg = app_pkg.split(".")[0]
+                            if top_pkg != app_pkg:
+                                top_pkg_id = f"pkg::{top_pkg}"
+                                self.graph.add_node(top_pkg_id, kind="PACKAGE", label=top_pkg, is_test=self.is_test)
+                                self.graph.add_edge(self.module_node_id, top_pkg_id, kind="IMPORTS")
+
         self.generic_visit(node)
 
     def visit_If(self, node: ast.If):
@@ -622,6 +640,10 @@ class RiskGraph:
                         # We know which name it is imported under, and nothing imports it
                         f.reachable = False
                         f.exposure = "DEAD"
+                        f.fp_likelihood = "HIGH"
+                        f.fp_reason = f"package '{pkg_name}' is not imported in the codebase"
+                        f.extra["fp_likelihood"] = f.fp_likelihood
+                        f.extra["fp_reason"] = f.fp_reason
                     else:
                         # We do NOT know its import name: absence of evidence is not evidence of absence
                         f.reachable = None
@@ -646,18 +668,27 @@ class RiskGraph:
                     if vulnerable_components:
                         any_imported = False
                         for comp in vulnerable_components:
-                            if self.graph.has_node(f"pkg::{comp.lower()}"):
+                            c_low = comp.lower()
+                            if self.graph.has_node(f"pkg::{c_low}"):
+                                any_imported = True
+                                break
+                            if any(n.startswith("pkg::") and (n.endswith(f"::{c_low}") or n.endswith(f".{c_low}")) for n in self.graph.nodes):
+                                any_imported = True
+                                break
+                            if any(n.endswith(f"::{c_low}") or n.endswith(f".{c_low}") for n in self.graph.nodes):
                                 any_imported = True
                                 break
                         if not any_imported:
                             f.symbol_reachable = False
                             f.fp_likelihood = "HIGH"
-                            f.fp_reason = "affected component not used"
+                            f.fp_reason = "affected component not used in codebase"
                             f.reachable = False
                             f.exposure = "DEAD"
                             f.blast_radius = 0
                             f.extra["exposure"] = f.exposure
                             f.extra["attack_path"] = []
+                            f.extra["fp_likelihood"] = f.fp_likelihood
+                            f.extra["fp_reason"] = f.fp_reason
                             continue
 
                 # Check if any entrypoint can reach pkg_node using O(1) ancestor check
