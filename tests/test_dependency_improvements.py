@@ -264,3 +264,61 @@ def test_is_dev_requirement_file():
     assert is_dev_requirement_file("dockerized_labs/lab1/requirements.txt") is True
     assert is_dev_requirement_file("requirements.txt") is False
     assert is_dev_requirement_file("Pipfile.lock") is False
+
+
+def test_dependency_engine_early_reachability_filtering(tmp_path):
+    """DependencyEngine with filter_unreachable=True drops dead packages when Python sources exist."""
+    from engines.dependency_engine import DependencyEngine
+    from core.cache import Cache
+    from tests.test_dependency_engine import FakeSession
+
+    (tmp_path / "app.py").write_text("import requests\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("requests==2.19.0\ndjango==2.2.0\n", encoding="utf-8")
+
+    fake_session = FakeSession(
+        osv_batch={
+            "requests==2.19.0": {"vulns": [{"id": "GHSA-req-1"}]},
+            "django==2.2.0": {"vulns": [{"id": "GHSA-django-1"}]},
+        },
+        vulns={
+            "GHSA-req-1": {
+                "id": "GHSA-req-1",
+                "summary": "Requests vuln",
+                "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"}],
+                "affected": [{"package": {"ecosystem": "PyPI", "name": "requests"}}],
+            },
+            "GHSA-django-1": {
+                "id": "GHSA-django-1",
+                "summary": "Django vuln",
+                "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"}],
+                "affected": [{"package": {"ecosystem": "PyPI", "name": "django"}}],
+            },
+        },
+        epss={},
+        kev=[],
+    )
+
+    # 1. With filter_unreachable=True: django (dead) is filtered, requests (used) is retained
+    engine_filtered = DependencyEngine(
+        session=fake_session,
+        cache=Cache(tmp_path / "cache1"),
+        backoff=0,
+        filter_unreachable=True,
+    )
+    findings_filtered = engine_filtered.scan(str(tmp_path))
+    assert len(findings_filtered) == 1
+    assert findings_filtered[0].extra["package"] == "requests"
+    assert engine_filtered.stats["unreachable_filtered"] == 1
+
+    # 2. With filter_unreachable=False: both findings are emitted
+    engine_unfiltered = DependencyEngine(
+        session=fake_session,
+        cache=Cache(tmp_path / "cache2"),
+        backoff=0,
+        filter_unreachable=False,
+    )
+    findings_unfiltered = engine_unfiltered.scan(str(tmp_path))
+    assert len(findings_unfiltered) == 2
+    packages = {f.extra["package"] for f in findings_unfiltered}
+    assert packages == {"requests", "django"}
+

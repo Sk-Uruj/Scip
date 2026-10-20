@@ -40,9 +40,10 @@ def get_engines(
     semgrep_rules: Optional[str] = None,
     enabled_engines: Optional[List[str]] = None,
     include_suppressed: bool = False,
+    filter_unreachable_deps: bool = True,
 ) -> list:
     all_engines = [
-        DependencyEngine(offline=offline),
+        DependencyEngine(offline=offline, filter_unreachable=filter_unreachable_deps),
         SecretsEngine(scan_history=scan_history),
         BanditEngine(config_file=bandit_config, include_suppressed=include_suppressed),
         SemgrepEngine(rules_path=semgrep_rules, include_suppressed=include_suppressed),
@@ -268,6 +269,8 @@ def main(argv=None) -> int:
                     help="custom Semgrep rules file, directory, or preset (e.g., p/python)")
     ap.add_argument("--engines", metavar="LIST",
                     help="comma-separated list of engines to run (e.g. dependency,secrets,bandit,semgrep)")
+    ap.add_argument("--all-dependencies", "--raw-dependencies", action="store_true",
+                    help="disable dependency reachability pre-filtering; report all raw CVEs from dependency files")
     ap.add_argument("--hide-fp", action="store_true",
                     help="hide findings labelled HIGH likelihood false positive (off by default). The count and "
                          "reasons are printed and, with --output, the hidden findings are saved to "
@@ -332,6 +335,7 @@ def main(argv=None) -> int:
         semgrep_rules=args.semgrep_rules,
         enabled_engines=enabled,
         include_suppressed=args.include_suppressed,
+        filter_unreachable_deps=not args.all_dependencies,
     )
 
     # When generating baseline, capture raw findings before suppression/dedup
